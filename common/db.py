@@ -486,3 +486,47 @@ def list_settled_current_month() -> list[dict]:
     with get_conn() as conn:
         rows = conn.execute(sql, (f"{y:04d}", f"{m:02d}")).fetchall()
         return [dict(r) for r in rows]
+
+        # ===== EXPORT QUERIES =====
+
+def export_doctors_overview() -> list[dict]:
+    """
+    Сводка по врачам: всего, рассчитано, не рассчитано.
+    """
+    sql = """
+    SELECT d.id           AS doctor_id,
+           d.full_name    AS doctor_full_name,
+           d.tg_user_id   AS doctor_tg_user_id,
+           COUNT(r.id)    AS total,
+           SUM(CASE WHEN r.settled = 0 THEN 1 ELSE 0 END) AS unsettled,
+           SUM(CASE WHEN r.settled = 1 THEN 1 ELSE 0 END) AS settled
+      FROM doctors d
+ LEFT JOIN referrals r ON r.doctor_id = d.id
+  GROUP BY d.id
+  ORDER BY d.full_name COLLATE NOCASE ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+def export_all_referrals() -> list[dict]:
+    """
+    Все направления с полями врача и пациента — для листа 'Все направления'.
+    """
+    sql = """
+    SELECT r.id           AS referral_id,
+           r.created_at   AS created_at,
+           r.settled      AS settled,
+           r.settled_at   AS settled_at,
+           p.full_name    AS patient_full_name,
+           p.birth_date   AS patient_birth_date,
+           d.id           AS doctor_id,
+           d.full_name    AS doctor_full_name
+      FROM referrals r
+      JOIN patients  p ON p.id = r.patient_id
+      JOIN doctors   d ON d.id = r.doctor_id
+  ORDER BY r.created_at ASC, r.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]

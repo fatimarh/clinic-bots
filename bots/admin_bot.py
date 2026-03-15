@@ -11,6 +11,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from datetime import datetime, date
+from aiogram.types import FSInputFile
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
 from common.config import get_admin_token, get_admin_access_pass, get_doctor_token
 from common.logging_config import setup_logger
 from common.db import (
@@ -25,6 +30,8 @@ from common.db import (
     settle_referrals,
     get_referrals_details,
     list_settled_current_month,
+    export_doctors_overview,
+    export_all_referrals,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,7 +52,7 @@ def _fmt_help() -> str:
         "• 🗑 Удалить врача — по номеру из последнего списка\n"
         "• 🆕 Новые (не рассчитанные) — отметить «рассчитано» по номерам\n"
         "• ✅ Рассчитанные — за текущий месяц\n"
-        "• 📤 Экспорт — скоро\n"
+        "• 📤 Экспорт (Excel)\n"
     )
 
 def _kb_main() -> InlineKeyboardBuilder:
@@ -55,7 +62,7 @@ def _kb_main() -> InlineKeyboardBuilder:
     kb.button(text="🗑 Удалить врача", callback_data="adm:del_doctor")
     kb.button(text="🆕 Новые (не рассчитанные)", callback_data="adm:new_unsettled")
     kb.button(text="✅ Рассчитанные", callback_data="adm:settled_current")
-    kb.button(text="📤 Экспорт (скоро)", callback_data="adm:export_soon")
+    kb.button(text="📤 Экспорт (Excel)", callback_data="adm:export")
     kb.adjust(1)
     return kb
 
@@ -151,10 +158,83 @@ async def auth_or_ignore(msg: Message):
 
 # ---- main menu actions ----
 
-@router.callback_query(F.data == "adm:export_soon")
-async def export_soon(cb: CallbackQuery):
-    await cb.message.answer("📤 Экспорт в Excel будет добавлен на следующем шаге.")
-    await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+def _fmt_birth_ru(birth_iso: str | None) -> str:
+    if not birth_iso:
+        return "???.???.????"
+    try:
+        return datetime.strptime(birth_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except Exception:
+        return birth_iso
+
+def _autosize(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            v = cell.value
+            l = len(str(v)) if v is not None else 0
+            if l > max_len:
+                max_len = l
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
+
+@router.callback_query(F.data == "adm:export")
+async def export_xlsx(cb: CallbackQuery):
+    # 1) Данные
+    doctors = export_doctors_overview()
+    refs = export_all_referrals()
+
+    # 2) Собираем книгу
+    wb = Workbook()
+
+    # Лист 1: Врачи (сводка)
+    ws = wb.active
+    ws.title = "Врачи"
+    ws.append(["#", "Врач", "Всего", "Не рассчитано", "Рассчитано"])
+    for i, d in enumerate(doctors, 1):
+        ws.append([
+            i,
+            d["doctor_full_name"],
+            int(d["total"] or 0),
+            int(d["unsettled"] or 0),
+            int(d["settled"] or 0),
+        ])
+    _autosize(ws)
+
+    # Лист 2: Все направления
+    ws2 = wb.create_sheet("Все направления")
+    ws2.append(["#", "Доктор", "Пациент", "Дата рождения", "Дата направления", "Статус", "Дата расчёта"])
+    for i, r in enumerate(refs, 1):
+        status = "рассчитан" if int(r["settled"] or 0) == 1 else "не рассчитан"
+        ws2.append([
+            i,
+            r["doctor_full_name"],
+            r["patient_full_name"],
+            _fmt_birth_ru(r.get("patient_birth_date")),
+            _fmt_ru_date(r.get("created_at")),
+            status,
+            _fmt_ru_date(r.get("settled_at")),
+        ])
+    _autosize(ws2)
+
+    # 3) Сохраняем во временный файл и отправляем
+    exports_dir = ROOT / "data" / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = exports_dir / f"clinic_export_{ts}.xlsx"
+
+    wb.save(fname)
+    try:
+        await cb.message.answer_document(
+            document=FSInputFile(str(fname)),
+            caption=f"Экспорт от {date.today().strftime('%d.%m.%Y')}"
+        )
+    finally:
+        # Можно оставить файл для архива; если хотите чистить — раскомментируйте:
+        # import os; 
+        # try: os.remove(fname)
+        # except: pass
+        pass
+
     await cb.answer()
 
 @router.callback_query(F.data == "adm:doctors")
