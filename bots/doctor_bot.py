@@ -1,3 +1,4 @@
+# bots/doctor_bot.py
 import asyncio
 import re
 from pathlib import Path
@@ -27,20 +28,25 @@ from common.db import (
     delete_referrals,
 )
 
+# --- logger ---
 ROOT = Path(__file__).resolve().parents[1]
 log = setup_logger("doctor_bot", ROOT / "logs" / "doctor.log")
 
+# --- router ---
 router = Router()
 
-# ---------- Validation ----------
-
-NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁёІіЇїЄє'’- ]{3,80}$")
+# =========================
+# Validation helpers
+# =========================
+# Разрешаем кириллицу/латиницу, пробел, дефис, апостроф (оба варианта)
+NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁёІіЇїЄє'’\- ]{3,80}$")
 
 def is_valid_full_name(text: str) -> bool:
-    return bool(NAME_RE.match(text.strip()))
+    return bool(text and NAME_RE.match(text.strip()))
 
 def parse_birth_date_ru(text: str) -> date | None:
-    s = text.strip()
+    """Ожидаем ДД.ММ.ГГГГ, реальная дата от 1900 до сегодня."""
+    s = (text or "").strip()
     try:
         d = datetime.strptime(s, "%d.%m.%Y").date()
     except Exception:
@@ -50,6 +56,7 @@ def parse_birth_date_ru(text: str) -> date | None:
     return d
 
 def fmt_iso_to_ru(iso_ts: str | None) -> str:
+    """Для created_at SQLite: 'YYYY-MM-DD HH:MM:SS' -> 'ДД.ММ.ГГГГ'."""
     if not iso_ts:
         return "???.???.????"
     try:
@@ -59,6 +66,7 @@ def fmt_iso_to_ru(iso_ts: str | None) -> str:
         return iso_ts
 
 def fmt_birth_ru(birth_iso: str | None) -> str:
+    """Для birth_date: 'YYYY-MM-DD' -> 'ДД.ММ.ГГГГ'."""
     if not birth_iso:
         return "???.???.????"
     try:
@@ -66,8 +74,9 @@ def fmt_birth_ru(birth_iso: str | None) -> str:
     except Exception:
         return birth_iso
 
-# ---------- Helpers (UI) ----------
-
+# =========================
+# UI helpers
+# =========================
 def fmt_help(initialized: bool) -> str:
     base = [
         "/start — начать",
@@ -81,9 +90,7 @@ def fmt_help(initialized: bool) -> str:
             "/patients — просмотр списков",
         ]
     else:
-        base += [
-            "Сначала укажите ФИО — бот запросит его автоматически.",
-        ]
+        base += ["Сначала укажите ФИО — бот запросит его автоматически."]
     return "\n".join(base)
 
 def build_quick_actions() -> InlineKeyboardBuilder:
@@ -97,7 +104,8 @@ def build_quick_actions() -> InlineKeyboardBuilder:
     kb.adjust(1, 1, 1, 2, 1)
     return kb
 
-async def send_quick_actions(message_obj):
+async def send_quick_actions(target: Message | CallbackQuery):
+    message_obj = target if isinstance(target, Message) else target.message
     await message_obj.answer(
         "Выберите следующее действие:",
         reply_markup=build_quick_actions().as_markup()
@@ -127,6 +135,7 @@ async def send_referral_list_numbered(
     show_settled_info: bool = False,
     filter_settled: int | None = None,
 ):
+    """Печать нумерованного списка направлений, с опциями."""
     if filter_settled is not None:
         items = [r for r in items if int(r.get("settled", 0) or 0) == int(filter_settled)]
 
@@ -135,7 +144,7 @@ async def send_referral_list_numbered(
         await send_quick_actions(msg)
         return
 
-    lines = []
+    lines: list[str] = []
     for i, r in enumerate(items, 1):
         fio = r["patient_full_name"]
         bd_ru = fmt_birth_ru(r.get("patient_birth_date"))
@@ -146,6 +155,7 @@ async def send_referral_list_numbered(
             line += f" — Рассчитан: {settled_at}"
         lines.append(line)
 
+    # Разбивка на чанки < 4096
     chunk = ""
     for line in lines:
         if len(chunk) + len(line) + 1 > 3500:
@@ -158,8 +168,9 @@ async def send_referral_list_numbered(
 
     await send_quick_actions(msg)
 
-# ---------- FSM ----------
-
+# =========================
+# FSM
+# =========================
 class Onboarding(StatesGroup):
     waiting_full_name = State()
 
@@ -174,8 +185,9 @@ class DeleteReferral(StatesGroup):
     waiting_numbers = State()
     confirm = State()
 
-# ---------- Handlers: onboarding/help -----------
-
+# =========================
+# Handlers: onboarding/help
+# =========================
 @router.message(CommandStart())
 async def start_handler(msg: Message, state: FSMContext):
     tg_user_id = msg.from_user.id
@@ -218,13 +230,12 @@ async def edit_name_start(msg: Message, state: FSMContext):
         await msg.answer("Вы ещё не зарегистрированы. Отправьте ваши ФИО одной строкой.")
         await state.set_state(Onboarding.waiting_full_name)
         return
-
     await msg.answer("Отправьте новые ФИО одной строкой (например: «Иванов Иван Иванович»).")
     await state.set_state(EditName.waiting_new_full_name)
 
 @router.message(Onboarding.waiting_full_name)
 async def onboarding_full_name(msg: Message, state: FSMContext):
-    full_name = msg.text.strip() if msg.text else ""
+    full_name = (msg.text or "").strip()
     if not is_valid_full_name(full_name):
         await msg.answer(
             "Некорректные ФИО. Разрешены буквы, пробел, дефис, апостроф. "
@@ -232,20 +243,16 @@ async def onboarding_full_name(msg: Message, state: FSMContext):
             "Попробуйте ещё раз:"
         )
         return
-
     tg_user_id = msg.from_user.id
     upsert_doctor(tg_user_id, full_name)
     await state.clear()
-    await msg.answer(
-        f"Готово. Зарегистрированы как: {full_name}\n\n" +
-        fmt_help(initialized=True)
-    )
+    await msg.answer(f"Готово. Зарегистрированы как: {full_name}\n\n" + fmt_help(initialized=True))
     await send_quick_actions(msg)
     log.info(f"Doctor registered tg_user_id={tg_user_id} full_name={full_name}")
 
 @router.message(EditName.waiting_new_full_name)
 async def edit_name_apply(msg: Message, state: FSMContext):
-    full_name = msg.text.strip() if msg.text else ""
+    full_name = (msg.text or "").strip()
     if not is_valid_full_name(full_name):
         await msg.answer(
             "Некорректные ФИО. Разрешены буквы, пробел, дефис, апостроф. "
@@ -253,7 +260,6 @@ async def edit_name_apply(msg: Message, state: FSMContext):
             "Попробуйте ещё раз:"
         )
         return
-
     tg_user_id = msg.from_user.id
     update_doctor_name(tg_user_id, full_name)
     await state.clear()
@@ -261,8 +267,9 @@ async def edit_name_apply(msg: Message, state: FSMContext):
     await send_quick_actions(msg)
     log.info(f"Doctor name updated tg_user_id={tg_user_id} full_name={full_name}")
 
-# ---------- Add patient (FSM) ----------
-
+# =========================
+# Add patient (FSM)
+# =========================
 @router.message(Command("add_patient"))
 async def add_patient_start(msg: Message, state: FSMContext):
     tg_user_id = msg.from_user.id
@@ -271,13 +278,12 @@ async def add_patient_start(msg: Message, state: FSMContext):
         await msg.answer("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await state.set_state(Onboarding.waiting_full_name)
         return
-
     await msg.answer("Введите ФИО пациента (одной строкой).")
     await state.set_state(AddPatient.waiting_patient_full_name)
 
 @router.message(AddPatient.waiting_patient_full_name)
 async def add_patient_full_name(msg: Message, state: FSMContext):
-    full_name = msg.text.strip() if msg.text else ""
+    full_name = (msg.text or "").strip()
     if not is_valid_full_name(full_name):
         await msg.answer(
             "Некорректные ФИО пациента. Разрешены буквы, пробел, дефис, апостроф. "
@@ -285,7 +291,6 @@ async def add_patient_full_name(msg: Message, state: FSMContext):
             "Попробуйте ещё раз:"
         )
         return
-
     await state.update_data(patient_full_name=full_name)
     await msg.answer("Введите дату рождения пациента в формате ДД.ММ.ГГГГ (например: 07.04.2018).")
     await state.set_state(AddPatient.waiting_patient_birth_date)
@@ -320,8 +325,9 @@ async def add_patient_birth_date(msg: Message, state: FSMContext):
     await send_quick_actions(msg)
     log.info(f"Referral added id={referral_id} doctor_id={doctor_id} patient='{patient_full_name}' {birth_iso}")
 
-# ---------- Patients list (inline) ----------
-
+# =========================
+# Patients list (inline)
+# =========================
 @router.message(Command("patients"))
 async def patients_menu(msg: Message):
     tg_user_id = msg.from_user.id
@@ -342,7 +348,6 @@ async def cb_patients_all(cb: CallbackQuery):
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     items = list_referrals_by_doctor(doctor_id)
     await _send_list_and_quick(cb.message, items, "Все пациенты")
     await cb.answer()
@@ -355,14 +360,12 @@ async def cb_patients_cur_month(cb: CallbackQuery):
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     today = date.today()
     items = list_referrals_by_doctor(doctor_id, year=today.year, month=today.month)
     await _send_list_and_quick(cb.message, items, f"Пациенты за {today.month:02d}.{today.year}")
     await cb.answer()
 
 # ---- Выбор года/месяца ----
-
 def build_years_kb(years: list[int]) -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     if not years:
@@ -394,7 +397,6 @@ async def cb_pick_year(cb: CallbackQuery):
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     years = list_years_with_referrals(doctor_id)
     await cb.message.edit_text("Выберите год:", reply_markup=build_years_kb(years).as_markup())
     await cb.answer()
@@ -403,14 +405,12 @@ async def cb_pick_year(cb: CallbackQuery):
 async def cb_pick_month(cb: CallbackQuery):
     parts = cb.data.split(":")
     year = int(parts[2])
-
     tg_user_id = cb.from_user.id
     doctor_id = get_doctor_id_by_tg(tg_user_id)
     if doctor_id is None:
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     months = list_months_for_year(doctor_id, year)
     await cb.message.edit_text(
         f"Выбран год {year}. Выберите месяц:",
@@ -422,20 +422,17 @@ async def cb_pick_month(cb: CallbackQuery):
 async def cb_list_year_month(cb: CallbackQuery):
     _, _, y, m = cb.data.split(":")
     year = int(y); month = int(m)
-
     tg_user_id = cb.from_user.id
     doctor_id = get_doctor_id_by_tg(tg_user_id)
     if doctor_id is None:
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     items = list_referrals_by_doctor(doctor_id, year=year, month=month)
     await _send_list_and_quick(cb.message, items, f"Пациенты за {month:02d}.{year}")
     await cb.answer()
 
 # ---- Рассчитанные / Не рассчитанные ----
-
 @router.callback_query(F.data == "patients:settled")
 async def cb_patients_settled(cb: CallbackQuery):
     tg_user_id = cb.from_user.id
@@ -444,7 +441,6 @@ async def cb_patients_settled(cb: CallbackQuery):
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     items = list_referrals_by_doctor(doctor_id)
     await send_referral_list_numbered(
         cb.message, items, "Рассчитанные пациенты", show_settled_info=True, filter_settled=1
@@ -459,15 +455,15 @@ async def cb_patients_unsettled(cb: CallbackQuery):
         await cb.message.edit_text("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
         await cb.answer()
         return
-
     items = list_referrals_by_doctor(doctor_id)
     await send_referral_list_numbered(
         cb.message, items, "Не рассчитанные пациенты", show_settled_info=False, filter_settled=0
     )
     await cb.answer()
 
-# ---- Удаление направлений ----
-
+# =========================
+# Удаление направлений
+# =========================
 @router.callback_query(F.data == "qa:delete_menu")
 async def qa_delete_menu(cb: CallbackQuery):
     await cb.message.answer("Выберите, откуда удалять:", reply_markup=build_delete_menu().as_markup())
@@ -547,3 +543,135 @@ async def del_pick_month(cb: CallbackQuery):
     await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=kb.as_markup())
     await cb.answer()
 
+@router.callback_query(F.data.startswith("del:ym:"))
+async def del_list_year_month(cb: CallbackQuery, state: FSMContext):
+    _, _, y, m = cb.data.split(":")
+    year, month = int(y), int(m)
+    tg_user_id = cb.from_user.id
+    doctor_id = get_doctor_id_by_tg(tg_user_id)
+    items = list_referrals_by_doctor(doctor_id, year=year, month=month) if doctor_id else []
+    await _start_delete_flow(cb.message, items, f"Удаление: {month:02d}.{year}", state)
+    await cb.answer()
+
+def _expand_numbers(spec: str, max_n: int) -> list[int]:
+    """
+    '3, 5-7, 12' -> [3,5,6,7,12]
+    """
+    result: set[int] = set()
+    tokens = [t.strip() for t in spec.replace(";", ",").split(",") if t.strip()]
+    for t in tokens:
+        if "-" in t:
+            a, b = t.split("-", 1)
+            if not a.isdigit() or not b.isdigit():
+                continue
+            x, y = int(a), int(b)
+            if x > y:
+                x, y = y, x
+            for k in range(x, y + 1):
+                if 1 <= k <= max_n:
+                    result.add(k)
+        else:
+            if t.isdigit():
+                k = int(t)
+                if 1 <= k <= max_n:
+                    result.add(k)
+    return sorted(result)
+
+@router.message(DeleteReferral.waiting_numbers)
+async def del_waiting_numbers(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip().lower()
+    if text in {"отмена", "cancel", "stop"}:
+        await state.clear()
+        await msg.answer("Отменено.")
+        await send_quick_actions(msg)
+        return
+
+    data = await state.get_data()
+    num2id: list[int] = data.get("del_num2id") or []
+    if not num2id:
+        await state.clear()
+        await msg.answer("Истёк контекст удаления. Попробуйте снова через меню удаления.")
+        await send_quick_actions(msg)
+        return
+
+    nums = _expand_numbers(text, len(num2id))
+    if not nums:
+        await msg.answer("Не распознал номера. Введите, например: `3, 5-7, 12` или `отмена`.", parse_mode="Markdown")
+        return
+
+    sel_ids = [num2id[i - 1] for i in nums]
+    await state.update_data(del_selected_ids=sel_ids, del_selected_nums=nums)
+
+    preview = ", ".join(map(str, nums))
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Удалить", callback_data="del:confirm")
+    kb.button(text="❌ Отмена", callback_data="del:cancel")
+    kb.adjust(2)
+
+    await msg.answer(
+        f"Подтвердите удаление: номеров [{preview}] (всего {len(nums)}).",
+        reply_markup=kb.as_markup()
+    )
+
+@router.callback_query(F.data == "del:confirm")
+async def del_confirm(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sel_ids: list[int] = data.get("del_selected_ids") or []
+
+    tg_user_id = cb.from_user.id
+    doctor_id = get_doctor_id_by_tg(tg_user_id)
+    deleted = delete_referrals(doctor_id, sel_ids) if (doctor_id and sel_ids) else 0
+
+    await state.clear()
+    await cb.message.answer(f"Удалено направлений: {deleted}.")
+    await send_quick_actions(cb.message)
+    await cb.answer()
+
+@router.callback_query(F.data == "del:cancel")
+async def del_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer("Отменено.")
+    await send_quick_actions(cb.message)
+    await cb.answer()
+
+# ---- Быстрые действия (прочее) ----
+@router.callback_query(F.data == "qa:add_patient")
+async def qa_add_patient(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("Введите ФИО пациента (одной строкой).")
+    await state.set_state(AddPatient.waiting_patient_full_name)
+    await cb.answer()
+
+@router.callback_query(F.data == "qa:patients_menu")
+async def qa_patients_menu(cb: CallbackQuery):
+    await cb.message.answer("Выберите режим:", reply_markup=build_patients_menu().as_markup())
+    await cb.answer()
+
+@router.callback_query(F.data == "qa:help")
+async def qa_help(cb: CallbackQuery):
+    await cb.message.answer(fmt_help(initialized=True))
+    await send_quick_actions(cb.message)
+    await cb.answer()
+
+# =========================
+# Entrypoint
+# =========================
+async def main():
+    migrate()
+    bot = Bot(get_doctor_token())
+
+    # для самопроверки токена — видно в логе, каким ботом запущено
+    me = await bot.get_me()
+    log.info(f"Running as @{me.username} (id={me.id})")
+
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+
+    log.info("Doctor bot starting...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception:
+        log.exception("Fatal error in doctor bot")
+        raise
