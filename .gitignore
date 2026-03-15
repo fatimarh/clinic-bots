@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs & data
+logs/
+data/*.db
+
+# Tokens & secrets
+tokens/*.tok
+tokens/*.pass
+
+# Keep examples (не игнорить шаблоны)
+!tokens/*.example
