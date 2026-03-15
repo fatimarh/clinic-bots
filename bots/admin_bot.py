@@ -1,18 +1,16 @@
 # bots/admin_bot.py
 import asyncio
 from collections import defaultdict
+from datetime import datetime, date
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-from datetime import datetime, date
-from aiogram.types import FSInputFile
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
@@ -22,52 +20,77 @@ from common.db import (
     migrate,
     admin_is_authorized,
     admin_authorize,
+
     list_doctors_with_counts,
     search_doctors_prefix,
     delete_doctor,
-    list_unsettled_referrals_all,
-    list_unsettled_referrals_by_doctor,
+
+    list_all_patients,
+
+    list_unvisited_all,
+    list_unvisited_by_doctor,
+    mark_referrals_visited,
+
+    list_ready_to_settle_all,
+    list_ready_to_settle_by_doctor,
     settle_referrals,
     get_referrals_details,
-    list_settled_current_month,
+
     export_doctors_overview,
     export_all_referrals,
+
+    list_patients_with_ref_counts,
+    delete_patients,
+    list_patients_by_doctor_distinct,
+    search_patients_prefix,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 log = setup_logger("admin_bot", ROOT / "logs" / "admin.log")
 
 router = Router()
-
-# второй бот для уведомлений врачей
 doctor_notify_bot: Bot | None = None
 
-# ------------------ utils ------------------
+
+# ---------------- utils ----------------
 
 def _fmt_help() -> str:
     return (
         "Админ-бот. Доступные действия:\n"
         "• 👨‍⚕️ Врачи — список врачей и их направлений\n"
         "• 🔎 Поиск врача — быстрый поиск по ФИО\n"
-        "• 🗑 Удалить врача — по номеру из последнего списка\n"
-        "• 🆕 Новые (не рассчитанные) — отметить «рассчитано» по номерам\n"
+        "• 🔎 Поиск пациента — быстрый поиск по ФИО\n"
+        "• 👥 Все пациенты — полный список пациентов клиники\n"
+        "• 🕓 Отметить визит — кого ещё не отметили\n"
+        "• 💳 Расчёт за визит — все отметившиеся или по врачу\n"
         "• ✅ Рассчитанные — за текущий месяц\n"
-        "• 📤 Экспорт (Excel)\n"
+        "• 🗑 Удалить пациента(ов) — по номерам из списка\n"
+        "• 📤 Экспорт — Excel-файл со сводкой и всеми направлениями\n"
     )
+
 
 def _kb_main() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
     kb.button(text="👨‍⚕️ Врачи", callback_data="adm:doctors")
     kb.button(text="🔎 Поиск врача", callback_data="adm:find")
-    kb.button(text="🗑 Удалить врача", callback_data="adm:del_doctor")
-    kb.button(text="🆕 Новые (не рассчитанные)", callback_data="adm:new_unsettled")
+    kb.button(text="🔎 Поиск пациента", callback_data="adm:find_patient")
+    kb.button(text="👥 Все пациенты", callback_data="adm:patients_all")
+    kb.button(text="🕓 Отметить визит", callback_data="adm:visits_menu")
+    kb.button(text="💳 Расчёт за визит", callback_data="adm:settle_menu")
     kb.button(text="✅ Рассчитанные", callback_data="adm:settled_current")
     kb.button(text="📤 Экспорт (Excel)", callback_data="adm:export")
     kb.adjust(1)
     return kb
 
+
+def _kb_help() -> InlineKeyboardBuilder:
+    kb = _kb_main()
+    kb.button(text="🗑 Удалить пациента(ов)", callback_data="adm:del_patients")
+    kb.adjust(1)
+    return kb
+
+
 async def _send_chunked(msg: Message, title: str, lines: list[str]):
-    """Отправка длинного списка частями (< 4096 символов)."""
     if not lines:
         await msg.answer(f"{title}\n(пусто)")
         return
@@ -80,21 +103,33 @@ async def _send_chunked(msg: Message, title: str, lines: list[str]):
     if chunk:
         await msg.answer(f"{title}\n{chunk.strip()}")
 
+
 def _fmt_ru_date(iso_ts: str | None) -> str:
     if not iso_ts:
-        return "???.???.????"
+        return "—"
     try:
-        from datetime import datetime as _dt
-        return _dt.fromisoformat(iso_ts).strftime("%d.%m.%Y")
+        return datetime.fromisoformat(iso_ts).strftime("%d.%m.%Y")
     except Exception:
-        return iso_ts
+        return "—"
+
+
+def _fmt_birth_ru(birth_iso: str | None) -> str:
+    if not birth_iso:
+        return "— дата не указана"
+    try:
+        return datetime.strptime(birth_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except Exception:
+        return "— дата не указана"
+
 
 def _expand_numbers(spec: str, max_n: int) -> list[int]:
     """
     '3, 5-7, 12' -> [3,5,6,7,12]
+    Поддерживает '-', '–', '—'.
     """
     result: set[int] = set()
-    tokens = [t.strip() for t in (spec or "").replace(";", ",").split(",") if t.strip()]
+    s = (spec or "").replace(";", ",").replace("–", "-").replace("—", "-")
+    tokens = [t.strip() for t in s.split(",") if t.strip()]
     for t in tokens:
         if "-" in t:
             a, b = t.split("-", 1)
@@ -113,58 +148,6 @@ def _expand_numbers(spec: str, max_n: int) -> list[int]:
                     result.add(k)
     return sorted(result)
 
-# ------------------ FSM ------------------
-
-class DelDoctor(StatesGroup):
-    waiting_number = State()
-    confirm = State()
-
-class FindDoctor(StatesGroup):
-    waiting_query = State()
-
-class MarkSettled(StatesGroup):
-    waiting_numbers = State()
-    confirm = State()
-
-# ------------------ Handlers ------------------
-
-@router.message(CommandStart())
-async def start_handler(msg: Message):
-    if admin_is_authorized(msg.chat.id):
-        await msg.answer("Вы уже авторизованы.\n" + _fmt_help(), reply_markup=_kb_main().as_markup())
-    else:
-        await msg.answer("Отправьте секретный пароль для доступа.")
-
-@router.message(Command("help"))
-async def help_handler(msg: Message):
-    if not admin_is_authorized(msg.chat.id):
-        await msg.answer("Сначала авторизуйтесь — отправьте секретный пароль.")
-        return
-    await msg.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
-
-# ВАЖНО: ловим только сообщения ВНЕ FSM (чтобы не перехватывать ввод в сценах поиска/удаления)
-@router.message(StateFilter(None))
-async def auth_or_ignore(msg: Message):
-    if admin_is_authorized(msg.chat.id):
-        return
-    secret = get_admin_access_pass()
-    if msg.text and msg.text.strip() == secret:
-        admin_authorize(msg.chat.id)
-        await msg.answer("✅ Авторизация успешна.", reply_markup=_kb_main().as_markup())
-        log.info(f"Admin chat authorized: {msg.chat.id}")
-    else:
-        # молча игнорируем
-        pass
-
-# ---- main menu actions ----
-
-def _fmt_birth_ru(birth_iso: str | None) -> str:
-    if not birth_iso:
-        return "???.???.????"
-    try:
-        return datetime.strptime(birth_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
-    except Exception:
-        return birth_iso
 
 def _autosize(ws):
     for col in ws.columns:
@@ -177,92 +160,131 @@ def _autosize(ws):
                 max_len = l
         ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
 
-@router.callback_query(F.data == "adm:export")
-async def export_xlsx(cb: CallbackQuery):
-    # 1) Данные
-    doctors = export_doctors_overview()
-    refs = export_all_referrals()
 
-    # 2) Собираем книгу
-    wb = Workbook()
+# ---------------- FSM ----------------
 
-    # Лист 1: Врачи (сводка)
-    ws = wb.active
-    ws.title = "Врачи"
-    ws.append(["#", "Врач", "Всего", "Не рассчитано", "Рассчитано"])
-    for i, d in enumerate(doctors, 1):
-        ws.append([
-            i,
-            d["doctor_full_name"],
-            int(d["total"] or 0),
-            int(d["unsettled"] or 0),
-            int(d["settled"] or 0),
-        ])
-    _autosize(ws)
+class DelDoctor(StatesGroup):
+    waiting_number = State()
+    confirm = State()
 
-    # Лист 2: Все направления
-    ws2 = wb.create_sheet("Все направления")
-    ws2.append(["#", "Доктор", "Пациент", "Дата рождения", "Дата направления", "Статус", "Дата расчёта"])
-    for i, r in enumerate(refs, 1):
-        status = "рассчитан" if int(r["settled"] or 0) == 1 else "не рассчитан"
-        ws2.append([
-            i,
-            r["doctor_full_name"],
-            r["patient_full_name"],
-            _fmt_birth_ru(r.get("patient_birth_date")),
-            _fmt_ru_date(r.get("created_at")),
-            status,
-            _fmt_ru_date(r.get("settled_at")),
-        ])
-    _autosize(ws2)
 
-    # 3) Сохраняем во временный файл и отправляем
-    exports_dir = ROOT / "data" / "exports"
-    exports_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    fname = exports_dir / f"clinic_export_{ts}.xlsx"
+class FindDoctor(StatesGroup):
+    waiting_query = State()
 
-    wb.save(fname)
-    try:
-        await cb.message.answer_document(
-            document=FSInputFile(str(fname)),
-            caption=f"Экспорт от {date.today().strftime('%d.%m.%Y')}"
-        )
-    finally:
-        # Можно оставить файл для архива; если хотите чистить — раскомментируйте:
-        # import os; 
-        # try: os.remove(fname)
-        # except: pass
-        pass
 
-    await cb.answer()
+class MarkVisited(StatesGroup):
+    waiting_numbers = State()
+    confirm = State()
+
+
+class MarkSettled(StatesGroup):
+    waiting_numbers = State()
+    confirm = State()
+
+
+class DelPatients(StatesGroup):
+    waiting_numbers = State()
+    confirm = State()
+
+
+class ViewDocPatients(StatesGroup):
+    waiting_number = State()
+
+
+class FindPatient(StatesGroup):
+    waiting_query = State()
+
+
+# ---------------- auth/help ----------------
+
+@router.message(CommandStart())
+async def start_handler(msg: Message):
+    if admin_is_authorized(msg.chat.id):
+        await msg.answer("✅ Авторизация успешна.\nℹ️ Полное меню — команда /help")
+        await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+    else:
+        await msg.answer("Отправьте секретный пароль для доступа.")
+
+
+@router.message(Command("help"))
+async def help_handler(msg: Message):
+    if not admin_is_authorized(msg.chat.id):
+        await msg.answer("Сначала авторизуйтесь — отправьте секретный пароль.")
+        return
+    await msg.answer(_fmt_help(), reply_markup=_kb_help().as_markup())
+
+
+# ловим пароль только вне FSM
+@router.message(StateFilter(None))
+async def auth_or_ignore(msg: Message):
+    if admin_is_authorized(msg.chat.id):
+        return
+    secret = get_admin_access_pass()
+    if msg.text and msg.text.strip() == secret:
+        admin_authorize(msg.chat.id)
+        await msg.answer("✅ Авторизация успешна.\nℹ️ Полное меню — команда /help")
+        await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+        log.info(f"Admin chat authorized: {msg.chat.id}")
+
+
+# ---------------- Врачи / поиск / пациенты врача / удаление врача ----------------
 
 @router.callback_query(F.data == "adm:doctors")
 async def list_doctors(cb: CallbackQuery, state: FSMContext):
     data = list_doctors_with_counts()
     if not data:
         await cb.message.answer("Список врачей пуст.")
-        await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
         await cb.answer()
         return
 
     lines = [f"{i}. {d['full_name']} — направлений: {d['referrals_count']}"
              for i, d in enumerate(data, 1)]
     await cb.message.answer("👨‍⚕️ Список врачей:")
-    await _send_chunked(cb.message, "Врачи:", lines)   # <-- await!
+    await _send_chunked(cb.message, "Врачи:", lines)
+    await state.update_data(last_doctor_list=[int(d["doctor_id"]) for d in data],
+                            last_doctor_lines=lines)
 
-    # map: index -> doctor_id, и сами строки списка
-    num2id = [int(d["doctor_id"]) for d in data]
-    await state.update_data(last_doctor_list=num2id, last_doctor_lines=lines)
-
-    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👁 Пациенты врача", callback_data="adm:doc_patients")
+    kb.button(text="🗑 Удалить врача", callback_data="adm:del_doctor")
+    kb.adjust(1)
+    await cb.message.answer("Действия со списком:", reply_markup=kb.as_markup())
     await cb.answer()
+
+
+@router.callback_query(F.data == "adm:doc_patients")
+async def doc_patients_start(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("Введите номер врача из последнего списка:")
+    await state.set_state(ViewDocPatients.waiting_number)
+    await cb.answer()
+
+
+@router.message(ViewDocPatients.waiting_number)
+async def doc_patients_show(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    last = data.get("last_doctor_list") or []
+    text = (msg.text or "").strip()
+    if not text.isdigit():
+        await msg.answer("Ожидался номер. Попробуйте ещё.")
+        return
+    idx = int(text)
+    if idx < 1 or idx > len(last):
+        await msg.answer("Неверный номер врача.")
+        return
+    doctor_id = last[idx - 1]
+    rows = list_patients_by_doctor_distinct(doctor_id)
+    lines = [f"{i}. {p['full_name']} — {_fmt_birth_ru(p.get('birth_date'))}" for i, p in enumerate(rows, 1)]
+    await _send_chunked(msg, "Пациенты врача:", lines or ["(нет)"])
+    await state.clear()
+    await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+
 
 @router.callback_query(F.data == "adm:find")
 async def find_start(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("Введите начало ФИО для поиска (например, «Ива»).")
+    await cb.message.answer("Введите начало ФИО врача (например, «Ива»).")
     await state.set_state(FindDoctor.waiting_query)
     await cb.answer()
+
 
 @router.message(FindDoctor.waiting_query)
 async def find_apply(msg: Message, state: FSMContext):
@@ -275,28 +297,28 @@ async def find_apply(msg: Message, state: FSMContext):
         return
 
     lines = [f"{i}. {d['full_name']} — направлений: {d['referrals_count']}" for i, d in enumerate(res, 1)]
-    await _send_chunked(msg, f"Результат поиска «{q}»: ", lines)  # <-- await!
+    await _send_chunked(msg, f"Результат поиска «{q}»: ", lines)
     await state.update_data(last_doctor_list=[int(d["doctor_id"]) for d in res],
                             last_doctor_lines=lines)
     await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await state.clear()
 
+
 @router.callback_query(F.data == "adm:del_doctor")
 async def del_doctor_start(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    last_ids = data.get("last_doctor_list")
     last_lines = data.get("last_doctor_lines")
+    last_ids = data.get("last_doctor_list")
     if not last_ids:
-        await cb.message.answer("Сначала откройте список врачей (кнопка «Врачи»), затем запускайте удаление.")
+        await cb.message.answer("Сначала откройте список врачей (кнопка «Врачи»).")
         await cb.answer()
         return
-
-    # Переотправим последний список для удобства выбора
     await cb.message.answer("👨‍⚕️ Список врачей (последний вывод):")
     await _send_chunked(cb.message, "Врачи:", last_lines or [])
     await cb.message.answer("Введите номер врача из последнего списка:")
     await state.set_state(DelDoctor.waiting_number)
     await cb.answer()
+
 
 @router.message(DelDoctor.waiting_number)
 async def del_doctor_number(msg: Message, state: FSMContext):
@@ -304,7 +326,7 @@ async def del_doctor_number(msg: Message, state: FSMContext):
     last: list[int] = data.get("last_doctor_list") or []
     text = (msg.text or "").strip()
     if not text.isdigit():
-        await msg.answer("Ожидался номер. Попробуйте ещё раз или нажмите /help")
+        await msg.answer("Ожидался номер. Попробуйте ещё раз.")
         return
     idx = int(text)
     if idx < 1 or idx > len(last):
@@ -312,9 +334,8 @@ async def del_doctor_number(msg: Message, state: FSMContext):
         return
 
     doctor_id = last[idx - 1]
-    # найдём имя для подтверждения
     name = "врач"
-    for i, d in enumerate(list_doctors_with_counts(), 1):
+    for d in list_doctors_with_counts():
         if d["doctor_id"] == doctor_id:
             name = d["full_name"]
             break
@@ -326,15 +347,16 @@ async def del_doctor_number(msg: Message, state: FSMContext):
     await msg.answer(f"Удалить №{idx}: {name} ?", reply_markup=kb.as_markup())
     await state.set_state(DelDoctor.confirm)
 
+
 @router.callback_query(F.data.startswith("adm:del_confirm:"))
 async def del_doctor_confirm(cb: CallbackQuery, state: FSMContext):
     doctor_id = int(cb.data.split(":")[-1])
     deleted = delete_doctor(doctor_id)
     await cb.message.answer(f"Удалено врачей: {deleted}. (Списки будут сдвинуты при следующем выводе)")
-    # cбросим кэш списка, чтобы вынудить заново открыть «Врачи»
     await state.update_data(last_doctor_list=None, last_doctor_lines=None)
     await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
+
 
 @router.callback_query(F.data == "adm:del_cancel")
 async def del_doctor_cancel(cb: CallbackQuery, state: FSMContext):
@@ -343,61 +365,102 @@ async def del_doctor_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
 
-# ---- Новые направления (не рассчитанные) ----
 
-@router.callback_query(F.data == "adm:new_unsettled")
-async def new_unsettled_menu(cb: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Все не рассчитанные", callback_data="adm:uns_all")
-    kb.button(text="По врачу", callback_data="adm:uns_choose_doctor")
-    kb.button(text="⬅️ Назад", callback_data="adm:back")
-    kb.adjust(1)
-    await cb.message.answer("Выберите:", reply_markup=kb.as_markup())
+# ---------------- Все пациенты ----------------
+
+@router.callback_query(F.data == "adm:patients_all")
+async def patients_all(cb: CallbackQuery):
+    rows = list_all_patients()
+    lines = [f"{i}. {p['full_name']} — {_fmt_birth_ru(p.get('birth_date'))}" for i, p in enumerate(rows, 1)]
+    await _send_chunked(cb.message, "Все пациенты:", lines)
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
 
-def _lines_for_unsettled(items: list[dict]) -> list[str]:
+
+# ---------------- Поиск пациента ----------------
+
+@router.callback_query(F.data == "adm:find_patient")
+async def find_patient_start(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("Введите начало ФИО пациента (например, «Ка»).")
+    await state.set_state(FindPatient.waiting_query)
+    await cb.answer()
+
+
+@router.message(FindPatient.waiting_query)
+async def find_patient_apply(msg: Message, state: FSMContext):
+    q = (msg.text or "").strip()
+    res = search_patients_prefix(q)
+    if not res:
+        await msg.answer("Ничего не найдено.")
+    else:
+        lines = []
+        for i, p in enumerate(res, 1):
+            lines.append(
+                f"{i}. {p['full_name']} — {_fmt_birth_ru(p.get('birth_date'))} "
+                f"(направлений: {int(p['referrals_count'] or 0)}, "
+                f"рассчитано: {int(p['settled_count'] or 0)})"
+            )
+        await _send_chunked(msg, f"Найдено по «{q}»: ", lines)
+    await state.clear()
+    await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+
+
+# ---------------- Отметить визит ----------------
+
+def _lines_for_unvisited(items: list[dict]) -> list[str]:
     lines = []
     for i, r in enumerate(items, 1):
         fio = r["patient_full_name"]
-        bd = r.get("patient_birth_date") or ""
-        if bd:
-            try:
-                from datetime import datetime as _dt
-                bd = _dt.strptime(bd, "%Y-%m-%d").strftime("%d.%m.%Y")
-            except Exception:
-                pass
+        bd = _fmt_birth_ru(r.get("patient_birth_date"))
         dadd = _fmt_ru_date(r.get("created_at"))
         doc = r["doctor_full_name"]
         lines.append(f"{i}. {fio} {bd} — направил: {doc} — дата: {dadd}")
     return lines
 
-async def _start_mark_flow(msg: Message, items: list[dict], state: FSMContext, title: str):
+
+async def _start_mark_visit_flow(msg: Message, items: list[dict], state: FSMContext, title: str):
     if not items:
         await msg.answer(f"{title}\nСписок пуст.")
         await msg.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
         return
+    await _send_chunked(msg, title, _lines_for_unvisited(items))
+    await state.update_data(visit_num2id=[int(r["referral_id"]) for r in items])
 
-    await _send_chunked(msg, title, _lines_for_unsettled(items))  # <-- await!
-
-    # сохраним соответствие
-    num2id = [int(r["referral_id"]) for r in items]
-    await state.update_data(mark_num2id=num2id)
+    # Быстрые действия «ВСЕ/Отмена»
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Отметить ВСЕ визиты", callback_data="adm:visit_all_ask")
+    kb.button(text="❌ Отмена", callback_data="adm:visit_cancel")
+    kb.adjust(2)
+    await msg.answer("Или одним нажатием:", reply_markup=kb.as_markup())
 
     await msg.answer(
-        "Введите номера для отметки «рассчитано» (например: `3, 5-7, 12`).\n"
+        "Введите номера для отметки визита (например: `3, 5-7, 12`).\n"
         "Для отмены — напишите `отмена`.",
         parse_mode="Markdown"
     )
-    await state.set_state(MarkSettled.waiting_numbers)
+    await state.set_state(MarkVisited.waiting_numbers)
 
-@router.callback_query(F.data == "adm:uns_all")
-async def uns_all(cb: CallbackQuery, state: FSMContext):
-    items = list_unsettled_referrals_all()
-    await _start_mark_flow(cb.message, items, state, "Новые направления (все не рассчитанные)")
+
+@router.callback_query(F.data == "adm:visits_menu")
+async def visits_menu(cb: CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Все не отмеченные визиты", callback_data="adm:vis_all")
+    kb.button(text="Не отмеченные — по врачу", callback_data="adm:vis_choose_doctor")
+    kb.button(text="⬅️ Назад", callback_data="adm:back")
+    kb.adjust(1)
+    await cb.message.answer("Выберите режим отметки визита:", reply_markup=kb.as_markup())
     await cb.answer()
 
-@router.callback_query(F.data == "adm:uns_choose_doctor")
-async def uns_choose_doctor(cb: CallbackQuery, state: FSMContext):
+
+@router.callback_query(F.data == "adm:vis_all")
+async def vis_all(cb: CallbackQuery, state: FSMContext):
+    items = list_unvisited_all()
+    await _start_mark_visit_flow(cb.message, items, state, "Не отмеченные визиты (все)")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:vis_choose_doctor")
+async def vis_choose_doctor(cb: CallbackQuery):
     docs = list_doctors_with_counts()
     if not docs:
         await cb.message.answer("Список врачей пуст.")
@@ -405,20 +468,203 @@ async def uns_choose_doctor(cb: CallbackQuery, state: FSMContext):
         return
     kb = InlineKeyboardBuilder()
     for i, d in enumerate(docs, 1):
-        kb.button(text=f"{i}. {d['full_name']}", callback_data=f"adm:uns_doc:{d['doctor_id']}")
+        kb.button(text=f"{i}. {d['full_name']}", callback_data=f"adm:vis_doc:{d['doctor_id']}")
     kb.adjust(1)
     await cb.message.answer("Выберите врача:", reply_markup=kb.as_markup())
     await cb.answer()
 
-@router.callback_query(F.data.startswith("adm:uns_doc:"))
-async def uns_for_doctor(cb: CallbackQuery, state: FSMContext):
+
+@router.callback_query(F.data.startswith("adm:vis_doc:"))
+async def vis_for_doctor(cb: CallbackQuery, state: FSMContext):
     doctor_id = int(cb.data.split(":")[-1])
-    items = list_unsettled_referrals_by_doctor(doctor_id)
-    await _start_mark_flow(cb.message, items, state, "Новые направления (по врачу)")
+    items = list_unvisited_by_doctor(doctor_id)
+    await _start_mark_visit_flow(cb.message, items, state, "Не отмеченные визиты (по врачу)")
     await cb.answer()
 
+
+@router.message(MarkVisited.waiting_numbers)
+async def mark_visit_numbers(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip().lower()
+    if text in {"отмена", "cancel", "stop"}:
+        await state.clear()
+        await msg.answer("Отменено.")
+        await msg.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+        return
+
+    data = await state.get_data()
+    num2id: list[int] = data.get("visit_num2id") or []
+    if not num2id:
+        await state.clear()
+        await msg.answer("Истёк контекст. Откройте список заново.")
+        await msg.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+        return
+
+    nums = _expand_numbers(text, len(num2id))
+    if not nums:
+        await msg.answer("Не распознал номера. Введите, например: `3, 5-7, 12` или `отмена`.", parse_mode="Markdown")
+        return
+
+    ref_ids = [num2id[i - 1] for i in nums]
+    await state.update_data(visit_selected_ids=ref_ids, visit_selected_nums=nums)
+
+    preview = ", ".join(map(str, nums))
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Отметить визит", callback_data="adm:visit_confirm")
+    kb.button(text="❌ Отмена", callback_data="adm:visit_cancel")
+    kb.adjust(2)
+
+    await msg.answer(f"Подтвердите отметку визита для номеров [{preview}] (всего {len(nums)}).",
+                     reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "adm:visit_all_ask")
+async def visit_all_ask(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ids = data.get("visit_num2id") or []
+    if not ids:
+        await cb.message.answer("Список пуст.")
+        await cb.answer()
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Подтвердить: {len(ids)}", callback_data="adm:visit_all_confirm")
+    kb.button(text="❌ Отмена", callback_data="adm:visit_cancel")
+    kb.adjust(2)
+    await cb.message.answer("Отметить визит всем из показанного списка?", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:visit_all_confirm")
+async def visit_all_confirm(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ids = data.get("visit_num2id") or []
+    updated = mark_referrals_visited(ids)
+
+    details = get_referrals_details(ids)
+    lines = []
+    for r in details:
+        fio = r["patient_full_name"]; bd = _fmt_birth_ru(r.get("patient_birth_date"))
+        dadd = _fmt_ru_date(r.get("created_at"))
+        lines.append(f"• {fio} {bd} — дата направления {dadd}")
+    if lines:
+        await cb.message.answer("Отмечены визиты:\n" + "\n".join(lines))
+
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➡️ Перейти к расчёту (все)", callback_data="adm:uns_all_ready")
+    kb.adjust(1)
+    await cb.message.answer(f"Отмечено визитов: {updated}.", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:visit_confirm")
+async def visit_confirm(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ref_ids: list[int] = data.get("visit_selected_ids") or []
+    updated = mark_referrals_visited(ref_ids)
+
+    details = get_referrals_details(ref_ids)
+    lines = []
+    for r in details:
+        fio = r["patient_full_name"]; bd = _fmt_birth_ru(r.get("patient_birth_date"))
+        dadd = _fmt_ru_date(r.get("created_at"))
+        lines.append(f"• {fio} {bd} — дата направления {dadd}")
+    if lines:
+        await cb.message.answer("Отмечены визиты:\n" + "\n".join(lines))
+
+    await state.clear()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➡️ Перейти к расчёту (все)", callback_data="adm:uns_all_ready")
+    kb.adjust(1)
+    await cb.message.answer(f"Отмечено визитов: {updated}.", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:visit_cancel")
+async def visit_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer("Отменено.")
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+    await cb.answer()
+
+
+# ---------------- 💳 Расчёт за визит (объединённый) ----------------
+
+def _lines_for_ready(items: list[dict]) -> list[str]:
+    lines = []
+    for i, r in enumerate(items, 1):
+        fio = r["patient_full_name"]
+        bd = _fmt_birth_ru(r.get("patient_birth_date"))
+        dadd = _fmt_ru_date(r.get("created_at"))
+        doc = r["doctor_full_name"]
+        lines.append(f"{i}. {fio} {bd} — врач: {doc} — дата направления: {dadd}")
+    return lines
+
+
+async def _start_mark_settle_flow(msg: Message, items: list[dict], state: FSMContext, title: str):
+    if not items:
+        await msg.answer(f"{title}\nСписок пуст.")
+        await msg.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+        return
+    await _send_chunked(msg, title, _lines_for_ready(items))
+    await state.update_data(mark_num2id=[int(r["referral_id"]) for r in items])
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Рассчитать ВСЕ", callback_data="adm:settle_all_ask")
+    kb.button(text="❌ Отмена", callback_data="adm:mark_cancel")
+    kb.adjust(2)
+    await msg.answer("Или одним нажатием:", reply_markup=kb.as_markup())
+
+    await msg.answer(
+        "Введите номера для расчёта (например: `3, 5-7, 12`).\n"
+        "Для отмены — напишите `отмена`.",
+        parse_mode="Markdown"
+    )
+    await state.set_state(MarkSettled.waiting_numbers)
+
+
+@router.callback_query(F.data == "adm:settle_menu")
+async def settle_menu(cb: CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Все, кто пришёл на визит", callback_data="adm:uns_all_ready")
+    kb.button(text="По врачу", callback_data="adm:settle_choose_doctor")
+    kb.button(text="⬅️ Назад", callback_data="adm:back")
+    kb.adjust(1)
+    await cb.message.answer("Выберите режим расчёта:", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:uns_all_ready")
+async def ready_all(cb: CallbackQuery, state: FSMContext):
+    items = list_ready_to_settle_all()
+    await _start_mark_settle_flow(cb.message, items, state, "Расчёт за визит (все отметившиеся)")
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:settle_choose_doctor")
+async def settle_choose_doctor(cb: CallbackQuery, state: FSMContext):
+    docs = list_doctors_with_counts()
+    if not docs:
+        await cb.message.answer("Список врачей пуст.")
+        await cb.answer()
+        return
+    kb = InlineKeyboardBuilder()
+    for i, d in enumerate(docs, 1):
+        kb.button(text=f"{i}. {d['full_name']}", callback_data=f"adm:uns_doc_ready:{d['doctor_id']}")
+    kb.adjust(1)
+    await cb.message.answer("Выберите врача:", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("adm:uns_doc_ready:"))
+async def ready_for_doctor(cb: CallbackQuery, state: FSMContext):
+    doctor_id = int(cb.data.split(":")[-1])
+    items = list_ready_to_settle_by_doctor(doctor_id)
+    await _start_mark_settle_flow(cb.message, items, state, "Расчёт за визит (по врачу)")
+    await cb.answer()
+
+
 @router.message(MarkSettled.waiting_numbers)
-async def mark_numbers(msg: Message, state: FSMContext):
+async def settle_numbers(msg: Message, state: FSMContext):
     text = (msg.text or "").strip().lower()
     if text in {"отмена", "cancel", "stop"}:
         await state.clear()
@@ -444,12 +690,40 @@ async def mark_numbers(msg: Message, state: FSMContext):
 
     preview = ", ".join(map(str, nums))
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Отметить рассчитано", callback_data="adm:mark_confirm")
+    kb.button(text="✅ Выполнить расчёт", callback_data="adm:mark_confirm")
     kb.button(text="❌ Отмена", callback_data="adm:mark_cancel")
     kb.adjust(2)
 
-    await msg.answer(f"Подтвердите отметку «рассчитано» для номеров [{preview}] (всего {len(nums)}).",
+    await msg.answer(f"Подтвердите расчёт для номеров [{preview}] (всего {len(nums)}).",
                      reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "adm:settle_all_ask")
+async def settle_all_ask(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ids = data.get("mark_num2id") or []
+    if not ids:
+        await cb.message.answer("Список пуст.")
+        await cb.answer()
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Подтвердить расчёт: {len(ids)}", callback_data="adm:settle_all_confirm")
+    kb.button(text="❌ Отмена", callback_data="adm:mark_cancel")
+    kb.adjust(2)
+    await cb.message.answer("Рассчитать всех из показанного списка?", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:settle_all_confirm")
+async def settle_all_confirm(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ids = data.get("mark_num2id") or []
+    updated = settle_referrals(ids)
+    await state.clear()
+    await cb.message.answer(f"Рассчитано: {updated}.")
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+    await cb.answer()
+
 
 @router.callback_query(F.data == "adm:mark_confirm")
 async def mark_confirm(cb: CallbackQuery, state: FSMContext):
@@ -459,13 +733,12 @@ async def mark_confirm(cb: CallbackQuery, state: FSMContext):
     updated = settle_referrals(ref_ids)
     await state.clear()
 
-    # соберём уведомления врачам (группами)
+    # уведомим врачей (батч)
     details = get_referrals_details(ref_ids)
     per_doctor: dict[int, list[dict]] = defaultdict(list)
     for r in details:
         per_doctor[int(r["doctor_tg_user_id"])].append(r)
 
-    # отправим каждому врачу одно сообщение (если есть tg_user_id)
     global doctor_notify_bot
     if doctor_notify_bot is not None:
         for tg_uid, rows in per_doctor.items():
@@ -474,13 +747,7 @@ async def mark_confirm(cb: CallbackQuery, state: FSMContext):
             lines = []
             for r in rows:
                 fio = r["patient_full_name"]
-                bd = r.get("patient_birth_date") or ""
-                if bd:
-                    try:
-                        from datetime import datetime as _dt
-                        bd = _dt.strptime(bd, "%Y-%m-%d").strftime("%d.%m.%Y")
-                    except Exception:
-                        pass
+                bd = _fmt_birth_ru(r.get("patient_birth_date"))
                 dadd = _fmt_ru_date(r.get("created_at"))
                 lines.append(f"• {fio} {bd} — дата направления {dadd}")
             text = "✅ Рассчитались за:\n" + "\n".join(lines)
@@ -489,59 +756,191 @@ async def mark_confirm(cb: CallbackQuery, state: FSMContext):
             except Exception as e:
                 log.warning(f"Notify doctor {tg_uid} failed: {e}")
 
-    await cb.message.answer(f"Отмечено «рассчитано»: {updated}.")
-    await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+    await cb.message.answer(f"Рассчитано: {updated}.")
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
+
 
 @router.callback_query(F.data == "adm:mark_cancel")
 async def mark_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.answer("Отменено.")
-    await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
 
-# ---- Рассчитанные (за текущий месяц) ----
+
+# ---------------- ✅ Рассчитанные (текущий месяц) ----------------
 
 @router.callback_query(F.data == "adm:settled_current")
 async def settled_current(cb: CallbackQuery):
-    rows = list_settled_current_month()
+    rows = export_all_referrals()
+    today = date.today()
+    yy, mm = f"{today.year:04d}", f"{today.month:02d}"
+    rows = [r for r in rows if str(r.get("settled")) == "1"
+            and (r.get("settled_at") and
+                 r["settled_at"][:4] == yy and r["settled_at"][5:7] == mm)]
     if not rows:
         await cb.message.answer("За текущий месяц рассчитанных нет.")
-        await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+        await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
         await cb.answer()
         return
 
     lines = []
     for i, r in enumerate(rows, 1):
         fio = r["patient_full_name"]
-        bd = r.get("patient_birth_date") or ""
-        if bd:
-            try:
-                from datetime import datetime as _dt
-                bd = _dt.strptime(bd, "%Y-%m-%d").strftime("%d.%m.%Y")
-            except Exception:
-                pass
+        bd = _fmt_birth_ru(r.get("patient_birth_date"))
         dadd = _fmt_ru_date(r.get("created_at"))
         dset = _fmt_ru_date(r.get("settled_at"))
         doc = r["doctor_full_name"]
         lines.append(f"{i}. {fio} {bd} — {doc} — направление: {dadd} — рассчитан: {dset}")
-
-    await _send_chunked(cb.message, "Рассчитанные за текущий месяц:", lines)  # <-- await!
-    await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+    await _send_chunked(cb.message, "Рассчитанные за текущий месяц:", lines)
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
+
+
+# ---------------- 📤 Экспорт (Excel) ----------------
+
+@router.callback_query(F.data == "adm:export")
+async def export_xlsx(cb: CallbackQuery):
+    doctors = export_doctors_overview()
+    refs = export_all_referrals()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Врачи"
+    ws.append(["#", "Врач", "Всего", "Не рассчитано", "Рассчитано"])
+    for i, d in enumerate(doctors, 1):
+        ws.append([i, d["doctor_full_name"], int(d["total"] or 0),
+                   int(d["unsettled"] or 0), int(d["settled"] or 0)])
+    _autosize(ws)
+
+    ws2 = wb.create_sheet("Все направления")
+    ws2.append(["#", "Доктор", "Пациент", "Дата рождения", "Дата направления", "Статус", "Дата расчёта", "Визит"])
+    for i, r in enumerate(refs, 1):
+        status = "рассчитан" if int(r["settled"] or 0) == 1 else "не рассчитан"
+        visited = "отмечен" if int(r["visited"] or 0) == 1 else "не отмечен"
+        ws2.append([
+            i,
+            r["doctor_full_name"],
+            r["patient_full_name"],
+            _fmt_birth_ru(r.get("patient_birth_date")),
+            _fmt_ru_date(r.get("created_at")),
+            status,
+            _fmt_ru_date(r.get("settled_at")),
+            visited,
+        ])
+    _autosize(ws2)
+
+    exports_dir = ROOT / "data" / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = exports_dir / f"clinic_export_{ts}.xlsx"
+    wb.save(fname)
+
+    await cb.message.answer_document(
+        document=FSInputFile(str(fname)),
+        caption=f"Экспорт от {date.today().strftime('%d.%m.%Y')}"
+    )
+    await cb.answer()
+
+
+# ---------------- 🗑 Удалить пациента(ов) (через /help) ----------------
+
+@router.callback_query(F.data == "adm:del_patients")
+async def del_patients_start(cb: CallbackQuery, state: FSMContext):
+    data = list_patients_with_ref_counts()
+    if not data:
+        await cb.message.answer("Пациентов нет.")
+        await cb.answer()
+        return
+
+    lines = []
+    for i, p in enumerate(data, 1):
+        lines.append(f"{i}. {p['full_name']} — {_fmt_birth_ru(p.get('birth_date'))} — направлений: {int(p['referrals_count'] or 0)}")
+    await _send_chunked(cb.message, "Пациенты (для удаления по номерам):", lines)
+
+    num2id = [int(p["patient_id"]) for p in data]
+    await state.update_data(delp_num2id=num2id, delp_lines=lines)
+
+    await cb.message.answer(
+        "Введите номера пациентов для удаления (например: `3, 5-7, 12`).\n"
+        "Внимание: их направления будут удалены каскадно.\n"
+        "Для отмены — напишите `отмена`.",
+        parse_mode="Markdown"
+    )
+    await state.set_state(DelPatients.waiting_numbers)
+    await cb.answer()
+
+
+@router.message(DelPatients.waiting_numbers)
+async def del_patients_numbers(msg: Message, state: FSMContext):
+    text = (msg.text or "").strip().lower()
+    if text in {"отмена", "cancel", "stop"}:
+        await state.clear()
+        await msg.answer("Отменено.")
+        await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+        return
+
+    data = await state.get_data()
+    num2id: list[int] = data.get("delp_num2id") or []
+    lines: list[str] = data.get("delp_lines") or []
+    if not num2id:
+        await state.clear()
+        await msg.answer("Истёк контекст. Откройте список заново.")
+        await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+        return
+
+    nums = _expand_numbers(text, len(num2id))
+    if not nums:
+        await msg.answer("Не распознал номера. Введите, например: `3, 5-7, 12` или `отмена`.", parse_mode="Markdown")
+        return
+
+    sel_ids = [num2id[i - 1] for i in nums]
+    preview_lines = [lines[i - 1] for i in nums][:20]
+    await state.update_data(delp_selected_ids=sel_ids, delp_selected_nums=nums)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Удалить: {len(sel_ids)}", callback_data="adm:del_patients_confirm")
+    kb.button(text="❌ Отмена", callback_data="adm:del_patients_cancel")
+    kb.adjust(2)
+
+    await msg.answer("К удалению:\n" + "\n".join(preview_lines), disable_web_page_preview=True)
+    await msg.answer("Подтвердите удаление выбранных пациентов.", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data == "adm:del_patients_confirm")
+async def del_patients_confirm(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    ids: list[int] = data.get("delp_selected_ids") or []
+    deleted = delete_patients(ids)
+    await state.clear()
+    await cb.message.answer(f"Удалено пациентов: {deleted}. (Связанные направления удалены каскадно)")
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "adm:del_patients_cancel")
+async def del_patients_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.answer("Отменено.")
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
+    await cb.answer()
+
+
+# ---------------- Back ----------------
 
 @router.callback_query(F.data == "adm:back")
 async def go_back(cb: CallbackQuery):
-    await cb.message.answer(_fmt_help(), reply_markup=_kb_main().as_markup())
+    await cb.message.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
     await cb.answer()
 
-# ------------------ Entrypoint ------------------
+
+# ---------------- Entrypoint ----------------
 
 async def main():
     migrate()
     admin_bot = Bot(get_admin_token())
 
-    # второй бот для уведомлений врачей
     global doctor_notify_bot
     doctor_notify_bot = Bot(get_doctor_token())
 
@@ -550,6 +949,7 @@ async def main():
 
     log.info("Admin bot starting...")
     await dp.start_polling(admin_bot)
+
 
 if __name__ == "__main__":
     try:
