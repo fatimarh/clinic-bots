@@ -57,6 +57,7 @@ def migrate() -> None:
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         tg_user_id INTEGER UNIQUE,
         full_name  TEXT NOT NULL,
+        full_name_lc TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -65,7 +66,9 @@ def migrate() -> None:
     CREATE TABLE IF NOT EXISTS patients (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         full_name  TEXT NOT NULL,
+        full_name_lc TEXT,
         birth_year INTEGER NOT NULL,
+        birth_date TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
@@ -76,7 +79,9 @@ def migrate() -> None:
         patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         settled    INTEGER DEFAULT 0,
-        settled_at TIMESTAMP NULL
+        settled_at TIMESTAMP NULL,
+        visited    INTEGER DEFAULT 0,
+        visited_at TIMESTAMP NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_referrals_doctor_created ON referrals(doctor_id, created_at);
@@ -91,11 +96,7 @@ def migrate() -> None:
     with get_conn() as conn:
         conn.executescript(sql)
 
-        # Добавим birth_date (если не было)
-        if not _column_exists(conn, "patients", "birth_date"):
-            conn.execute("ALTER TABLE patients ADD COLUMN birth_date TEXT")
-
-        # Смягчим NOT NULL у birth_year, если ещё стоит
+        # Добавим/смягчим поля для пациентов (если БД старая)
         try:
             by_notnull = _col_notnull(conn, "patients", "birth_year")
         except Exception:
@@ -107,6 +108,7 @@ def migrate() -> None:
                 CREATE TABLE IF NOT EXISTS patients_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     full_name  TEXT NOT NULL,
+                    full_name_lc TEXT,
                     birth_year INTEGER,
                     birth_date TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -116,25 +118,37 @@ def migrate() -> None:
             )
             conn.execute(
                 """
-                INSERT INTO patients_new(id, full_name, birth_year, birth_date, created_at, updated_at)
-                SELECT id, full_name, birth_year, NULL, created_at, updated_at FROM patients
+                INSERT INTO patients_new(id, full_name, full_name_lc, birth_year, birth_date, created_at, updated_at)
+                SELECT id, full_name, NULL, birth_year, birth_date, created_at, updated_at FROM patients
                 """
             )
             conn.execute("DROP TABLE patients")
             conn.execute("ALTER TABLE patients_new RENAME TO patients")
             conn.commit()
 
+        # Индекс по ФИО/дате рождения
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_patients_fullname_birthdate ON patients(full_name, birth_date)"
         )
 
-        # NEW: колонки визита для referrals
-        if not _column_exists(conn, "referrals", "visited"):
-            conn.execute("ALTER TABLE referrals ADD COLUMN visited INTEGER DEFAULT 0")
-        if not _column_exists(conn, "referrals", "visited_at"):
-            conn.execute("ALTER TABLE referrals ADD COLUMN visited_at TIMESTAMP NULL")
+        # --- lc-поля для регистронезависимого поиска ---
+        if not _column_exists(conn, "patients", "full_name_lc"):
+            conn.execute("ALTER TABLE patients ADD COLUMN full_name_lc TEXT")
+            rows = conn.execute("SELECT id, full_name FROM patients").fetchall()
+            for r in rows:
+                conn.execute("UPDATE patients SET full_name_lc = ? WHERE id = ?", (str(r["full_name"]).lower(), r["id"]))
+            conn.commit()
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_patients_fullname_lc ON patients(full_name_lc)")
 
-    log.info("Migrations applied (SQLite WAL mode, birth_date + visited supported)")
+        if not _column_exists(conn, "doctors", "full_name_lc"):
+            conn.execute("ALTER TABLE doctors ADD COLUMN full_name_lc TEXT")
+            rows = conn.execute("SELECT id, full_name FROM doctors").fetchall()
+            for r in rows:
+                conn.execute("UPDATE doctors SET full_name_lc = ? WHERE id = ?", (str(r["full_name"]).lower(), r["id"]))
+            conn.commit()
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_doctors_fullname_lc ON doctors(full_name_lc)")
+
+    log.info("Migrations applied (SQLite WAL mode, birth_date + visited + lc fields supported)")
 
 
 # --- Admin auth ---
@@ -167,28 +181,31 @@ def get_doctor_by_tg(tg_user_id: int) -> Optional[dict]:
 
 
 def upsert_doctor(tg_user_id: int, full_name: str) -> None:
+    full_name_lc = (full_name or "").lower()
     with get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO doctors(tg_user_id, full_name)
-            VALUES (?, ?)
+            INSERT INTO doctors(tg_user_id, full_name, full_name_lc)
+            VALUES (?, ?, ?)
             ON CONFLICT(tg_user_id) DO UPDATE SET
-                full_name = excluded.full_name,
-                updated_at = CURRENT_TIMESTAMP
+                full_name    = excluded.full_name,
+                full_name_lc = excluded.full_name_lc,
+                updated_at   = CURRENT_TIMESTAMP
             """,
-            (tg_user_id, full_name),
+            (tg_user_id, full_name, full_name_lc),
         )
 
 
 def update_doctor_name(tg_user_id: int, full_name: str) -> None:
+    full_name_lc = (full_name or "").lower()
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE doctors
-               SET full_name = ?, updated_at = CURRENT_TIMESTAMP
+               SET full_name = ?, full_name_lc = ?, updated_at = CURRENT_TIMESTAMP
              WHERE tg_user_id = ?
             """,
-            (full_name, tg_user_id),
+            (full_name, full_name_lc, tg_user_id),
         )
 
 
@@ -224,8 +241,8 @@ def get_or_create_patient(full_name: str, birth_date_iso: str) -> int:
         except Exception:
             year_val = None
         cur = conn.execute(
-            "INSERT INTO patients(full_name, birth_date, birth_year) VALUES(?, ?, ?)",
-            (full_name, birth_date_iso, year_val),
+            "INSERT INTO patients(full_name, full_name_lc, birth_date, birth_year) VALUES(?, ?, ?, ?)",
+            (full_name, (full_name or "").lower(), birth_date_iso, year_val),
         )
         return int(cur.lastrowid)
 
@@ -301,6 +318,24 @@ def delete_referrals(doctor_id: int, referral_ids: list[int]) -> int:
         return cur.rowcount
 
 
+# --- Search helpers (case-insensitive, from word start) ---
+
+def _build_token_like_sql_from_word_start(column: str, tokens: list[str]) -> tuple[str, list[str]]:
+    """
+    Для каждого токена строим (col LIKE 'tok%' OR col LIKE '% tok%'), объединяем через AND.
+    """
+    if not tokens:
+        return "1=1", []
+    parts = []
+    args: list[str] = []
+    for t in tokens:
+        tl = t.lower()
+        parts.append(f"({column} LIKE ? OR {column} LIKE ?)")
+        args += [f"{tl}%", f"% {tl}%"]
+    where = " AND ".join(parts)
+    return where, args
+
+
 # --- Aggregates / export basics ---
 
 def list_doctors_with_counts() -> list[dict]:
@@ -320,25 +355,21 @@ def list_doctors_with_counts() -> list[dict]:
 
 
 def search_doctors_prefix(q: str) -> list[dict]:
-    q = (q or "").strip()
-    if not q:
-        return []
-    like1 = f"{q}%"
-    like2 = f"% {q}%"
-    sql = """
+    tokens = [t for t in (q or "").strip().split() if t]
+    where, args = _build_token_like_sql_from_word_start("d.full_name_lc", tokens)
+    sql = f"""
     SELECT d.id         AS doctor_id,
            d.full_name  AS full_name,
            d.tg_user_id AS tg_user_id,
            COUNT(r.id)  AS referrals_count
       FROM doctors d
  LEFT JOIN referrals r ON r.doctor_id = d.id
-     WHERE d.full_name LIKE ? ESCAPE '\\'
-        OR d.full_name LIKE ? ESCAPE '\\'
+     WHERE {where}
   GROUP BY d.id
   ORDER BY d.full_name COLLATE NOCASE ASC
     """
     with get_conn() as conn:
-        rows = conn.execute(sql, (like1, like2)).fetchall()
+        rows = conn.execute(sql, tuple(args)).fetchall()
         return [dict(r) for r in rows]
 
 
@@ -382,7 +413,7 @@ def export_all_referrals() -> list[dict]:
         return [dict(r) for r in rows]
 
 
-# --- NEW: поддержка отметки визита и подготовки к расчёту ---
+# --- Visits & Settlement ---
 
 def list_all_patients() -> list[dict]:
     with get_conn() as conn:
@@ -534,10 +565,6 @@ def get_referrals_details(referral_ids: list[int]) -> list[dict]:
 # --- Доп. утилиты для пациентов ---
 
 def list_patients_with_ref_counts() -> list[dict]:
-    """
-    Полный список пациентов с количеством направлений по каждому.
-    Используется в админ-боте для удаления пациентов по номерам.
-    """
     sql = """
     SELECT p.id            AS patient_id,
            p.full_name     AS full_name,
@@ -554,11 +581,6 @@ def list_patients_with_ref_counts() -> list[dict]:
 
 
 def delete_patients(patient_ids: list[int]) -> int:
-    """
-    Удаляет пациентов по id. Связанные направления удаляются каскадно
-    (FK ON DELETE CASCADE уже включён в миграциях).
-    Возвращает количество удалённых пациентов.
-    """
     if not patient_ids:
         return 0
     placeholders = ",".join(["?"] * len(patient_ids))
@@ -569,9 +591,6 @@ def delete_patients(patient_ids: list[int]) -> int:
 
 
 def list_patients_by_doctor_distinct(doctor_id: int) -> list[dict]:
-    """
-    Уникальный список пациентов, у которых есть направления от данного врача.
-    """
     sql = """
     SELECT DISTINCT p.id AS patient_id,
                     p.full_name AS full_name,
@@ -579,7 +598,7 @@ def list_patients_by_doctor_distinct(doctor_id: int) -> list[dict]:
       FROM referrals r
       JOIN patients  p ON p.id = r.patient_id
      WHERE r.doctor_id = ?
-  ORDER BY p.full_name COLLATE NOCASE ASC, p.id ASC
+  ORDER BY p.full_name_lc ASC, p.id ASC
     """
     with get_conn() as conn:
         rows = conn.execute(sql, (doctor_id,)).fetchall()
@@ -587,26 +606,59 @@ def list_patients_by_doctor_distinct(doctor_id: int) -> list[dict]:
 
 
 def search_patients_prefix(q: str) -> list[dict]:
-    """
-    Поиск пациента по префиксу ФИО. Возвращает ФИО, дату рождения,
-    количество направлений и количество расчётов.
-    """
-    q = (q or "").strip()
-    if not q:
-        return []
-    like1, like2 = f"{q}%", f"% {q}%"
-    sql = """
+    tokens = [t for t in (q or "").strip().split() if t]
+    where, args = _build_token_like_sql_from_word_start("p.full_name_lc", tokens)
+    sql = f"""
     SELECT p.id         AS patient_id,
            p.full_name  AS full_name,
            p.birth_date AS birth_date,
-           COUNT(r.id)  AS referrals_count,
-           SUM(CASE WHEN r.settled = 1 THEN 1 ELSE 0 END) AS settled_count
+           SUM(CASE WHEN r.visited = 1 THEN 1 ELSE 0 END)  AS visits_count,
+           SUM(CASE WHEN r.settled = 1 THEN 1 ELSE 0 END)  AS settled_count
       FROM patients p
  LEFT JOIN referrals r ON r.patient_id = p.id
-     WHERE p.full_name LIKE ? ESCAPE '\\' OR p.full_name LIKE ? ESCAPE '\\'
+     WHERE {where}
   GROUP BY p.id
   ORDER BY p.full_name COLLATE NOCASE ASC, p.id ASC
     """
     with get_conn() as conn:
-        rows = conn.execute(sql, (like1, like2)).fetchall()
+        rows = conn.execute(sql, tuple(args)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_referrals_for_patient(patient_id: int) -> list[dict]:
+    sql = """
+    SELECT r.id         AS referral_id,
+           r.created_at AS created_at,
+           r.visited    AS visited,
+           r.visited_at AS visited_at,
+           r.settled    AS settled,
+           r.settled_at AS settled_at,
+           d.full_name  AS doctor_full_name
+      FROM referrals r
+      JOIN doctors   d ON d.id = r.doctor_id
+     WHERE r.patient_id = ?
+  ORDER BY r.created_at ASC, r.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql, (patient_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+def list_doctor_patients_visit_status(doctor_id: int) -> list[dict]:
+    """
+    По врачу: уникальные пациенты с признаком визита и последней датой визита.
+    """
+    sql = """
+    SELECT p.id          AS patient_id,
+           p.full_name   AS full_name,
+           p.birth_date  AS birth_date,
+           MAX(CASE WHEN r.visited = 1 THEN 1 ELSE 0 END) AS visited_any,
+           MAX(r.visited_at) AS last_visited_at
+      FROM referrals r
+      JOIN patients  p ON p.id = r.patient_id
+     WHERE r.doctor_id = ?
+  GROUP BY p.id
+  ORDER BY p.full_name_lc ASC, p.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql, (doctor_id,)).fetchall()
         return [dict(r) for r in rows]
