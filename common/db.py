@@ -310,3 +310,179 @@ def delete_referrals(doctor_id: int, referral_ids: list[int]) -> int:
     with get_conn() as conn:
         cur = conn.execute(sql, (doctor_id, *referral_ids))
         return cur.rowcount
+
+        # ===== ADMIN QUERIES =====
+
+def list_doctors_with_counts() -> list[dict]:
+    """
+    Возвращает список врачей с количеством направлений.
+    Порядок — по дате создания (стабильный).
+    """
+    sql = """
+    SELECT d.id            AS doctor_id,
+           d.full_name     AS full_name,
+           d.tg_user_id    AS tg_user_id,
+           COUNT(r.id)     AS referrals_count
+      FROM doctors d
+ LEFT JOIN referrals r ON r.doctor_id = d.id
+  GROUP BY d.id
+  ORDER BY d.created_at ASC, d.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+
+def search_doctors_prefix(q: str) -> list[dict]:
+    """
+    Поиск по префиксу любой части ФИО (начало строки или после пробела).
+    Пример: 'Ив' найдёт 'Иванов Пётр' и 'Пётр Иванов' (по второй части).
+    """
+    q = (q or "").strip()
+    if not q:
+        return []
+    like1 = f"{q}%"      # начало строки
+    like2 = f"% {q}%"    # после пробела
+    sql = """
+    SELECT d.id         AS doctor_id,
+           d.full_name  AS full_name,
+           d.tg_user_id AS tg_user_id,
+           COUNT(r.id)  AS referrals_count
+      FROM doctors d
+ LEFT JOIN referrals r ON r.doctor_id = d.id
+     WHERE d.full_name LIKE ? ESCAPE '\\'
+        OR d.full_name LIKE ? ESCAPE '\\'
+  GROUP BY d.id
+  ORDER BY d.full_name COLLATE NOCASE ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql, (like1, like2)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def delete_doctor(doctor_id: int) -> int:
+    """
+    Удаляет врача (каскадно удалятся его referrals за счёт FK ON DELETE CASCADE).
+    Возвращает количество удалённых строк в таблице doctors (0/1).
+    """
+    with get_conn() as conn:
+        cur = conn.execute("DELETE FROM doctors WHERE id = ?", (doctor_id,))
+        return cur.rowcount
+
+
+def list_unsettled_referrals_all() -> list[dict]:
+    """
+    Все НЕ рассчитанные направления со всеми деталями (для админа).
+    """
+    sql = """
+    SELECT r.id           AS referral_id,
+           r.created_at   AS created_at,
+           p.full_name    AS patient_full_name,
+           p.birth_date   AS patient_birth_date,
+           d.id           AS doctor_id,
+           d.full_name    AS doctor_full_name,
+           d.tg_user_id   AS doctor_tg_user_id
+      FROM referrals r
+      JOIN patients  p ON p.id = r.patient_id
+      JOIN doctors   d ON d.id = r.doctor_id
+     WHERE r.settled = 0
+  ORDER BY r.created_at ASC, r.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_unsettled_referrals_by_doctor(doctor_id: int) -> list[dict]:
+    sql = """
+    SELECT r.id           AS referral_id,
+           r.created_at   AS created_at,
+           p.full_name    AS patient_full_name,
+           p.birth_date   AS patient_birth_date,
+           d.id           AS doctor_id,
+           d.full_name    AS doctor_full_name,
+           d.tg_user_id   AS doctor_tg_user_id
+      FROM referrals r
+      JOIN patients  p ON p.id = r.patient_id
+      JOIN doctors   d ON d.id = r.doctor_id
+     WHERE r.settled = 0
+       AND r.doctor_id = ?
+  ORDER BY r.created_at ASC, r.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql, (doctor_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def settle_referrals(referral_ids: list[int]) -> int:
+    """
+    Отмечает направления как рассчитанные.
+    Возвращает количество обновлённых записей.
+    """
+    if not referral_ids:
+        return 0
+    placeholders = ",".join(["?"] * len(referral_ids))
+    sql = f"""
+        UPDATE referrals
+           SET settled = 1,
+               settled_at = CURRENT_TIMESTAMP
+         WHERE id IN ({placeholders})
+           AND settled = 0
+    """
+    with get_conn() as conn:
+        cur = conn.execute(sql, tuple(referral_ids))
+        return cur.rowcount
+
+
+def get_referrals_details(referral_ids: list[int]) -> list[dict]:
+    """
+    Детали направлений по id — для уведомлений врачу.
+    """
+    if not referral_ids:
+        return []
+    placeholders = ",".join(["?"] * len(referral_ids))
+    sql = f"""
+    SELECT r.id           AS referral_id,
+           r.created_at   AS created_at,
+           p.full_name    AS patient_full_name,
+           p.birth_date   AS patient_birth_date,
+           d.id           AS doctor_id,
+           d.full_name    AS doctor_full_name,
+           d.tg_user_id   AS doctor_tg_user_id
+      FROM referrals r
+      JOIN patients  p ON p.id = r.patient_id
+      JOIN doctors   d ON d.id = r.doctor_id
+     WHERE r.id IN ({placeholders})
+  ORDER BY r.created_at ASC, r.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql, tuple(referral_ids)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_settled_current_month() -> list[dict]:
+    """
+    Рассчитанные направления за текущий месяц (для админ-отчёта одним списком).
+    """
+    from datetime import date
+    today = date.today()
+    y, m = today.year, today.month
+    sql = """
+    SELECT r.id           AS referral_id,
+           r.created_at   AS created_at,
+           r.settled_at   AS settled_at,
+           p.full_name    AS patient_full_name,
+           p.birth_date   AS patient_birth_date,
+           d.id           AS doctor_id,
+           d.full_name    AS doctor_full_name
+      FROM referrals r
+      JOIN patients  p ON p.id = r.patient_id
+      JOIN doctors   d ON d.id = r.doctor_id
+     WHERE r.settled = 1
+       AND strftime('%Y', r.settled_at) = ?
+       AND strftime('%m', r.settled_at) = ?
+  ORDER BY r.settled_at ASC, r.id ASC
+    """
+    with get_conn() as conn:
+        rows = conn.execute(sql, (f"{y:04d}", f"{m:02d}")).fetchall()
+        return [dict(r) for r in rows]
