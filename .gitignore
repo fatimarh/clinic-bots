@@ -3,21 +3,29 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.egg-info/
 .venv/
-venv/
+.env
 
-# IDE
-.vscode/
-.idea/
+# OS
+.DS_Store
 
-# Logs & data
+# Logs
 logs/
+*.log
+
+# Data (не храним прод-данные в Git)
+data/clinic.db
+data/clinic.db-*
+data/clinic.db-*.*
 data/*.db
+data/*.sqlite
+data/*.sqlite3
 
-# Tokens & secrets
-tokens/*.tok
-tokens/*.pass
+# Экспортируемые файлы
+data/exports/
+*.xlsx
 
-# Keep examples (не игнорить шаблоны)
-!tokens/*.example
+# Токены/пароли (на всякий случай)
+tokens/
+*.pass
+*.tok
