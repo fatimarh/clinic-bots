@@ -1,4 +1,4 @@
-# bots/admin_bot.py
+# bots/admin_bot.py (TOPs fix + Excel sheet rename)
 import asyncio
 from collections import defaultdict
 from datetime import datetime, date
@@ -44,6 +44,10 @@ from common.db import (
     list_patients_by_doctor_distinct,
     search_patients_prefix,
     list_referrals_for_patient,
+
+    # TOPs
+    top_doctors_by_referrals,
+    top_doctors_by_visits,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,7 +57,7 @@ router = Router()
 doctor_notify_bot: Bot | None = None
 
 
-# ---------------- utils ----------------
+# -------- utils --------
 
 def _fmt_help() -> str:
     return (
@@ -63,11 +67,12 @@ def _fmt_help() -> str:
         "• 🔎 Поиск пациента — быстрый поиск по ФИО\n"
         "• 👥 Все пациенты — полный список пациентов клиники\n"
         "• 📋 Списки пациентов — вывод за всё время/месяц/год+месяц\n"
+        "• 🏆 Рейтинг врачей — ТОП по направлениям/визитам\n"
         "• 🕓 Отметить визит — кого ещё не отметили\n"
         "• 💳 Расчёт за визит — все отметившиеся или по врачу\n"
         "• ✅ Рассчитанные — за текущий месяц\n"
         "• 🗑 Удалить пациента(ов) — по номерам из списка\n"
-        "• 📤 Экспорт — Excel-файл со сводкой и всеми направлениями\n"
+        "• 📤 Экспорт — Excel-файл со сводкой, направлениями и рейтингом\n"
     )
 
 
@@ -78,6 +83,7 @@ def _kb_main() -> InlineKeyboardBuilder:
     kb.button(text="🔎 Поиск пациента", callback_data="adm:find_patient")
     kb.button(text="👥 Все пациенты", callback_data="adm:patients_all")
     kb.button(text="📋 Списки пациентов", callback_data="adm:plist_menu")
+    kb.button(text="🏆 Рейтинг врачей", callback_data="adm:tops_menu")
     kb.button(text="🕓 Отметить визит", callback_data="adm:visits_menu")
     kb.button(text="💳 Расчёт за визит", callback_data="adm:settle_menu")
     kb.button(text="✅ Рассчитанные", callback_data="adm:settled_current")
@@ -167,7 +173,7 @@ def _autosize(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 2, 60)
 
 
-# ---------------- FSM ----------------
+# -------- FSM --------
 
 class DelDoctor(StatesGroup):
     waiting_number = State()
@@ -211,7 +217,12 @@ class PListChoose(StatesGroup):
     waiting_number = State()
 
 
-# ---------------- auth/help ----------------
+class TopChoose(StatesGroup):
+    waiting_year = State()
+    waiting_month = State()
+
+
+# -------- auth/help --------
 
 @router.message(CommandStart())
 async def start_handler(msg: Message):
@@ -242,7 +253,7 @@ async def auth_or_ignore(msg: Message):
         log.info(f"Admin chat authorized: {msg.chat.id}")
 
 
-# ---------------- Врачи / поиск / пациенты врача ----------------
+# -------- Врачи / поиск / пациенты врача --------
 
 @router.callback_query(F.data == "adm:doctors")
 async def list_doctors(cb: CallbackQuery, state: FSMContext):
@@ -328,7 +339,7 @@ async def find_apply(msg: Message, state: FSMContext):
     await state.clear()
 
 
-# ---------------- Все пациенты + «кто направлял» ----------------
+# -------- Все пациенты + кто направлял --------
 
 @router.callback_query(F.data == "adm:patients_all")
 async def patients_all(cb: CallbackQuery, state: FSMContext):
@@ -389,168 +400,123 @@ async def who_directed(msg: Message, state: FSMContext):
     await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
 
 
-# ---------------- 📋 Списки пациентов (всё / текущий месяц / год+месяц) ----------------
+# -------- Рейтинг врачей (ТОПы) --------
 
-@router.callback_query(F.data == "adm:plist_menu")
-async def plist_menu(cb: CallbackQuery):
+@router.callback_query(F.data == "adm:tops_menu")
+async def tops_menu(cb: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
-    kb.button(text="Весь список", callback_data="adm:plist_all")
-    kb.button(text="Текущий месяц", callback_data="adm:plist_curr")
-    kb.button(text="Выбрать год и месяц", callback_data="adm:plist_choose")
+    kb.button(text="ТОП по направлениям", callback_data="adm:top:ref")
+    kb.button(text="ТОП по визитам", callback_data="adm:top:vis")
     kb.button(text="⬅️ Назад", callback_data="adm:back")
     kb.adjust(1)
-    await cb.message.answer("Выберите режим:", reply_markup=kb.as_markup())
+    await cb.message.answer("Что показать?", reply_markup=kb.as_markup())
     await cb.answer()
 
 
-def _lines_for_referrals(items: list[dict]) -> list[str]:
+@router.callback_query(F.data.in_({"adm:top:ref", "adm:top:vis"}))
+async def top_period_menu(cb: CallbackQuery, state: FSMContext):
+    metric = cb.data.split(":")[-1]  # ref / vis
+    await state.update_data(top_metric=metric)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Весь период", callback_data="adm:top:p:all")
+    kb.button(text="Текущий месяц", callback_data="adm:top:p:curr")
+    kb.button(text="Выбрать год и месяц", callback_data="adm:top:p:choose")
+    kb.button(text="⬅️ Назад", callback_data="adm:tops_menu")
+    kb.adjust(1)
+    title = "ТОП по направлениям" if metric == "ref" else "ТОП по визитам"
+    await cb.message.answer(f"{title}: выберите период", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+def _lines_for_top(rows: list[dict]) -> list[str]:
     lines = []
-    for i, r in enumerate(items, 1):
-        fio = r["patient_full_name"]
-        bd = _fmt_birth_ru(r.get("patient_birth_date"))
-        dadd = _fmt_ru_date(r.get("created_at"))
-        doc = r["doctor_full_name"]
-        visited = "был" if int(r.get("visited") or 0) == 1 else "не был"
-        vdate = _fmt_ru_date(r.get("visited_at"))
-        lines.append(f"{i}. {fio} — {bd} — направил: {doc} — направл.: {dadd} — визит: {visited} ({vdate})")
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. {r['doctor_full_name']} — {int(r['cnt'] or 0)}")
     return lines
 
 
-def _ref_filter_by_year_month(rows: list[dict], year: int | None, month: int | None) -> list[dict]:
-    if year is None:
-        return rows
-    yy = f"{year:04d}"
-    if month is None:
-        return [r for r in rows if (r.get("created_at") or "")[:4] == yy]
-    mm = f"{month:02d}"
-    return [r for r in rows if (r.get("created_at") or "").startswith(f"{yy}-{mm}")]
+async def _show_top(cb: CallbackQuery, state: FSMContext, year: int | None, month: int | None):
+    data = await state.get_data()
+    metric = data.get("top_metric")
+    if metric == "ref":
+        rows = top_doctors_by_referrals(year, month, limit=100)
+        title = "ТОП по направлениям"
+    else:
+        rows = top_doctors_by_visits(year, month, limit=100)
+        title = "ТОП по визитам"
+
+    if year and month:
+        title += f" — {month:02d}.{year}"
+    elif year:
+        title += f" — {year}"
+    else:
+        title += " — весь период"
+
+    await _send_chunked(cb.message, title + ":", _lines_for_top(rows))
 
 
-async def _plist_show(cb: CallbackQuery, state: FSMContext, title: str, year: int | None, month: int | None):
-    rows = export_all_referrals()
-    items = _ref_filter_by_year_month(rows, year, month)
-    await _send_chunked(cb.message, title, _lines_for_referrals(items))
-    await state.update_data(plist_map=[int(x["referral_id"]) for x in items])
-    await cb.message.answer(
-        "Чтобы показать карточку по строке — отправьте её номер.\nИли нажмите «⬅️ В меню».",
-        reply_markup=_kb_back_menu().as_markup()
-    )
-    await state.set_state(PListChoose.waiting_number)
-
-
-@router.callback_query(F.data == "adm:plist_all")
-async def plist_all(cb: CallbackQuery, state: FSMContext):
-    await _plist_show(cb, state, "Пациенты (все направления):", None, None)
+@router.callback_query(F.data == "adm:top:p:all")
+async def top_all(cb: CallbackQuery, state: FSMContext):
+    await _show_top(cb, state, None, None)
     await cb.answer()
 
 
-@router.callback_query(F.data == "adm:plist_curr")
-async def plist_curr(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "adm:top:p:curr")
+async def top_curr(cb: CallbackQuery, state: FSMContext):
     t = date.today()
-    await _plist_show(cb, state, f"Пациенты за {t.month:02d}.{t.year}:", t.year, t.month)
+    await _show_top(cb, state, t.year, t.month)
     await cb.answer()
 
 
-@router.callback_query(F.data == "adm:plist_choose")
-async def plist_choose_start(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "adm:top:p:choose")
+async def top_choose_year(cb: CallbackQuery, state: FSMContext):
     rows = export_all_referrals()
     years = sorted({int((r.get("created_at") or "")[:4]) for r in rows if (r.get("created_at") or "")[:4].isdigit()})
     if not years:
         years = [date.today().year]
     kb = InlineKeyboardBuilder()
     for y in years:
-        kb.button(text=str(y), callback_data=f"adm:plist_year:{y}")
-    kb.button(text="⬅️ Назад", callback_data="adm:plist_menu")
+        kb.button(text=str(y), callback_data=f"adm:top:y:{y}")
+    kb.button(text="⬅️ Назад", callback_data="adm:tops_menu")
     kb.adjust(3)
     await cb.message.answer("Выберите год:", reply_markup=kb.as_markup())
-    await state.set_state(PListChoose.waiting_year)
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("adm:plist_year:"))
-async def plist_choose_month(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("adm:top:y:"))
+async def top_choose_month(cb: CallbackQuery, state: FSMContext):
     year = int(cb.data.split(":")[-1])
-    await state.update_data(plist_year=year)
+    await state.update_data(top_year=year)
     kb = InlineKeyboardBuilder()
     for m in range(1, 13):
-        kb.button(text=f"{m:02d}", callback_data=f"adm:plist_month:{m:02d}")
-    kb.button(text="⬅️ Назад", callback_data="adm:plist_choose")
+        kb.button(text=f"{m:02d}", callback_data=f"adm:top:m:{m:02d}")
+    kb.button(text="⬅️ Назад", callback_data="adm:top:p:choose")
     kb.adjust(6)
     await cb.message.answer(f"Выбран год {year}. Выберите месяц:", reply_markup=kb.as_markup())
-    await state.set_state(PListChoose.waiting_month)
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("adm:plist_month:"))
-async def plist_show_year_month(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("adm:top:m:"))
+async def top_show_month(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    year = int(data.get("plist_year"))
+    year = int(data.get("top_year"))
     month = int(cb.data.split(":")[-1])
-    await _plist_show(cb, state, f"Пациенты за {month:02d}.{year}:", year, month)
+    await _show_top(cb, state, year, month)
     await cb.answer()
 
 
-@router.message(PListChoose.waiting_number)
-async def plist_show_card(msg: Message, state: FSMContext):
-    text = (msg.text or "").strip()
-    if not text.isdigit():
-        await msg.answer("Нужен номер строки. Или нажмите «⬅️ В меню».", reply_markup=_kb_back_menu().as_markup())
-        return
+# -------- Отметить визит --------
 
-    data = await state.get_data()
-    arr: list[int] = data.get("plist_map") or []
-    idx = int(text)
-    if idx < 1 or idx > len(arr):
-        await msg.answer("Неверный номер строки. Попробуйте ещё.", reply_markup=_kb_back_menu().as_markup())
-        return
-
-    ref_id = arr[idx - 1]
-    det = get_referrals_details([ref_id])[0]
-
-    doc = det["doctor_full_name"]
-    dadd = _fmt_ru_date(det.get("created_at"))
-    visited = "был" if int(det.get("visited") or 0) == 1 else "не был"
-    vdate = _fmt_ru_date(det.get("visited_at"))
-    fio = det["patient_full_name"]
-    bd = _fmt_birth_ru(det.get("patient_birth_date"))
-
-    await msg.answer(
-        f"• {fio} — {bd}\n"
-        f"  направил: {doc} — дата направления: {dadd}\n"
-        f"  визит: {visited} ({vdate})"
-    )
-
-
-# ---------------- Поиск пациента ----------------
-
-@router.callback_query(F.data == "adm:find_patient")
-async def find_patient_start(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("Введите начало ФИО пациента (например, «Ка»).", reply_markup=_kb_back_menu().as_markup())
-    await state.set_state(FindPatient.waiting_query)
+@router.callback_query(F.data == "adm:visits_menu")
+async def visits_menu(cb: CallbackQuery, state: FSMContext):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Все не отмеченные визиты", callback_data="adm:vis_all")
+    kb.button(text="Не отмеченные — по врачу", callback_data="adm:vis_choose_doctor")
+    kb.button(text="⬅️ Назад", callback_data="adm:back")
+    kb.adjust(1)
+    await cb.message.answer("Выберите режим отметки визита:", reply_markup=kb.as_markup())
     await cb.answer()
 
-
-@router.message(FindPatient.waiting_query)
-async def find_patient_apply(msg: Message, state: FSMContext):
-    q = (msg.text or "").strip()
-    res = search_patients_prefix(q)
-    if not res:
-        await msg.answer("Ничего не найдено.")
-    else:
-        lines = []
-        for i, p in enumerate(res, 1):
-            v = "был" if int(p.get("visits_count") or 0) > 0 else "не был"
-            s = "да" if int(p.get("settled_count") or 0) > 0 else "—"
-            lines.append(
-                f"{i}. {p['full_name']} — {_fmt_birth_ru(p.get('birth_date'))} "
-                f"(визит: {v}; расчёт: {s})"
-            )
-        await _send_chunked(msg, f"Найдено по «{q}»: ", lines)
-    await state.clear()
-    await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
-
-
-# ---------------- Отметить визит ----------------
 
 def _lines_for_unvisited(items: list[dict]) -> list[str]:
     lines = []
@@ -582,17 +548,6 @@ async def _start_mark_visit_flow(msg: Message, items: list[dict], state: FSMCont
         parse_mode="Markdown"
     )
     await state.set_state(MarkVisited.waiting_numbers)
-
-
-@router.callback_query(F.data == "adm:visits_menu")
-async def visits_menu(cb: CallbackQuery, state: FSMContext):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Все не отмеченные визиты", callback_data="adm:vis_all")
-    kb.button(text="Не отмеченные — по врачу", callback_data="adm:vis_choose_doctor")
-    kb.button(text="⬅️ Назад", callback_data="adm:back")
-    kb.adjust(1)
-    await cb.message.answer("Выберите режим отметки визита:", reply_markup=kb.as_markup())
-    await cb.answer()
 
 
 @router.callback_query(F.data == "adm:vis_all")
@@ -728,39 +683,7 @@ async def visit_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ---------------- 💳 Расчёт за визит (все/по врачу) ----------------
-
-def _lines_for_ready(items: list[dict]) -> list[str]:
-    lines = []
-    for i, r in enumerate(items, 1):
-        fio = r["patient_full_name"]
-        bd = _fmt_birth_ru(r.get("patient_birth_date"))
-        dadd = _fmt_ru_date(r.get("created_at"))
-        doc = r["doctor_full_name"]
-        lines.append(f"{i}. {fio} {bd} — врач: {doc} — дата направления: {dadd}")
-    return lines
-
-
-async def _start_mark_settle_flow(msg: Message, items: list[dict], state: FSMContext, title: str):
-    if not items:
-        await msg.answer(f"{title}\nСписок пуст.")
-        await msg.answer("Выберите действие:", reply_markup=_kb_main().as_markup())
-        return
-    await _send_chunked(msg, title, _lines_for_ready(items))
-    await state.update_data(mark_num2id=[int(r["referral_id"]) for r in items])
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Рассчитать ВСЕ", callback_data="adm:settle_all_ask")
-    kb.button(text="❌ Отмена", callback_data="adm:mark_cancel")
-    kb.adjust(2)
-    await msg.answer("Или одним нажатием:", reply_markup=kb.as_markup())
-
-    await msg.answer(
-        "Введите номера для расчёта (например: `3, 5-7, 12`).",
-        parse_mode="Markdown"
-    )
-    await state.set_state(MarkSettled.waiting_numbers)
-
+# -------- Расчёт за визит --------
 
 @router.callback_query(F.data == "adm:settle_menu")
 async def settle_menu(cb: CallbackQuery, state: FSMContext):
@@ -861,7 +784,6 @@ async def settle_all_confirm(cb: CallbackQuery, state: FSMContext):
 
     updated = settle_referrals(ids)
 
-    # NEW: notify doctors just like mark_confirm
     details = get_referrals_details(ids)
     per_doctor: dict[int, list[dict]] = defaultdict(list)
     for r in details:
@@ -933,7 +855,7 @@ async def mark_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ---------------- ✅ Рассчитанные (текущий месяц) ----------------
+# -------- Рассчитанные (текущий месяц) --------
 
 @router.callback_query(F.data == "adm:settled_current")
 async def settled_current(cb: CallbackQuery):
@@ -961,7 +883,7 @@ async def settled_current(cb: CallbackQuery):
     await cb.answer()
 
 
-# ---------------- 📤 Экспорт (Excel) ----------------
+# -------- Экспорт (Excel) --------
 
 @router.callback_query(F.data == "adm:export")
 async def export_xlsx(cb: CallbackQuery):
@@ -998,6 +920,20 @@ async def export_xlsx(cb: CallbackQuery):
         ])
     _autosize(ws2)
 
+    ws3 = wb.create_sheet("Рейтинг врачей")
+    top_ref = top_doctors_by_referrals(limit=100)
+    ws3.append(["ТОП по направлениям (весь период)"])
+    ws3.append(["#", "Врач", "Направлений"])
+    for i, r in enumerate(top_ref, 1):
+        ws3.append([i, r["doctor_full_name"], int(r["cnt"] or 0)])
+    ws3.append([])
+    top_vis = top_doctors_by_visits(limit=100)
+    ws3.append(["ТОП по визитам (весь период)"])
+    ws3.append(["#", "Врач", "Визитов"])
+    for i, r in enumerate(top_vis, 1):
+        ws3.append([i, r["doctor_full_name"], int(r["cnt"] or 0)])
+    _autosize(ws3)
+
     exports_dir = ROOT / "data" / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1011,7 +947,7 @@ async def export_xlsx(cb: CallbackQuery):
     await cb.answer()
 
 
-# ---------------- 🗑 Удалить пациента(ов) ----------------
+# -------- Удалить пациента(ов) --------
 
 @router.callback_query(F.data == "adm:del_patients")
 async def del_patients_start(cb: CallbackQuery, state: FSMContext):
@@ -1094,7 +1030,7 @@ async def del_patients_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
-# ---------------- Back ----------------
+# -------- Back --------
 
 @router.callback_query(F.data == "adm:back")
 async def go_back(cb: CallbackQuery):
@@ -1102,7 +1038,7 @@ async def go_back(cb: CallbackQuery):
     await cb.answer()
 
 
-# ---------------- Entrypoint ----------------
+# -------- Entrypoint --------
 
 async def main():
     migrate()

@@ -403,6 +403,51 @@ def export_all_referrals() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+# --- TOPs ---
+
+def top_doctors_by_referrals(year: int | None = None, month: int | None = None, limit: int = 50) -> list[dict]:
+    base = """
+    SELECT d.id AS doctor_id, d.full_name AS doctor_full_name, COUNT(r.id) AS cnt
+      FROM doctors d
+ LEFT JOIN referrals r ON r.doctor_id = d.id
+    """
+    where = ""
+    args: list[str] = []
+    if year is not None and month is not None:
+        where = "WHERE r.id IS NOT NULL AND strftime('%Y', r.created_at)=? AND strftime('%m', r.created_at)=?"
+        args = [f"{year:04d}", f"{month:02d}"]
+    elif year is not None:
+        where = "WHERE r.id IS NOT NULL AND strftime('%Y', r.created_at)=?"
+        args = [f"{year:04d}"]
+    group = " GROUP BY d.id ORDER BY cnt DESC, d.full_name COLLATE NOCASE ASC LIMIT ?"
+    sql = base + (" " + where if where else "") + group
+    with get_conn() as conn:
+        rows = conn.execute(sql, (*args, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def top_doctors_by_visits(year: int | None = None, month: int | None = None, limit: int = 50) -> list[dict]:
+    base = """
+    SELECT d.id AS doctor_id, d.full_name AS doctor_full_name,
+           SUM(CASE WHEN r.visited = 1 THEN 1 ELSE 0 END) AS cnt
+      FROM doctors d
+ LEFT JOIN referrals r ON r.doctor_id = d.id
+    """
+    where = ""
+    args: list[str] = []
+    if year is not None and month is not None:
+        where = "WHERE r.id IS NOT NULL AND strftime('%Y', r.created_at)=? AND strftime('%m', r.created_at)=?"
+        args = [f"{year:04d}", f"{month:02d}"]
+    elif year is not None:
+        where = "WHERE r.id IS NOT NULL AND strftime('%Y', r.created_at)=?"
+        args = [f"{year:04d}"]
+    group = " GROUP BY d.id ORDER BY cnt DESC, d.full_name COLLATE NOCASE ASC LIMIT ?"
+    sql = base + (" " + where if where else "") + group
+    with get_conn() as conn:
+        rows = conn.execute(sql, (*args, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+
 # --- Visits & Settlement ---
 
 def list_all_patients() -> list[dict]:
