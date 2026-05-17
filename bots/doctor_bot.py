@@ -26,6 +26,7 @@ from common.db import (
     list_years_with_referrals,
     list_months_for_year,
     delete_referrals,
+    update_doctor_profile,
 )
 
 # --- logger ---
@@ -37,7 +38,33 @@ router = Router()
 
 # =========================
 # Validation helpers
+
+#  Phone validation --- проверяем на корректность формата +7XXXXXXXXXX
+PHONE_RE = re.compile(r"^\+?\d[\d\s\-\(\)]{9,18}$")
+
+def normalize_phone(text: str) -> str | None:
+    s = (text or "").strip()
+    if not PHONE_RE.match(s):
+        return None
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) < 10 or len(digits) > 12:
+        return None
+    if digits.startswith("7"):
+        return "+" + digits
+    return "+" + digits
 # =========================
+def doctor_profile_complete(doctor: dict | None) -> bool:
+    if not doctor:
+        return False
+    return all([
+        (doctor.get("phone") or "").strip(),
+        (doctor.get("specialization") or "").strip(),
+        (doctor.get("workplace") or "").strip(),
+        (doctor.get("city") or "").strip(),
+    ])
+
 # Разрешаем кириллицу/латиницу, пробел, дефис, апостроф (оба варианта)
 NAME_RE = re.compile(r"^[A-Za-zА-Яа-яЁёІіЇїЄє'’\- ]{3,80}$")
 
@@ -84,14 +111,41 @@ def fmt_help(initialized: bool) -> str:
     ]
     if initialized:
         base += [
-            "/whoami — показать текущее ФИО",
-            "/edit_name — изменить ФИО",
             "/add_patient — добавить пациента",
             "/patients — просмотр списков",
+            "/profile — ваш профиль и изменение данных",
         ]
     else:
         base += ["Сначала укажите ФИО — бот запросит его автоматически."]
     return "\n".join(base)
+
+def fmt_profile(doctor: dict) -> str:
+    return (
+        "👤 <b>Ваш профиль</b>\n\n"
+        f"ФИО: <b>{doctor.get('full_name') or '—'}</b>\n"
+        f"Телефон: <b>{doctor.get('phone') or '—'}</b>\n"
+        f"Специализация: <b>{doctor.get('specialization') or '—'}</b>\n"
+        f"Место работы: <b>{doctor.get('workplace') or '—'}</b>\n"
+        f"Город: <b>{doctor.get('city') or '—'}</b>\n"
+    )
+
+def kb_profile() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏ Изменить данные", callback_data="profile:edit")
+    kb.button(text="⬅️ Назад", callback_data="profile:back")
+    kb.adjust(1)
+    return kb
+
+def kb_profile_fields() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="ФИО", callback_data="profile:field:full_name")
+    kb.button(text="Телефон", callback_data="profile:field:phone")
+    kb.button(text="Специализация", callback_data="profile:field:specialization")
+    kb.button(text="Место работы", callback_data="profile:field:workplace")
+    kb.button(text="Город", callback_data="profile:field:city")
+    kb.button(text="⬅️ Назад", callback_data="profile:back")
+    kb.adjust(1)
+    return kb
 
 def build_quick_actions() -> InlineKeyboardBuilder:
     kb = InlineKeyboardBuilder()
@@ -100,8 +154,9 @@ def build_quick_actions() -> InlineKeyboardBuilder:
     kb.button(text="🗑 Удалить направление", callback_data="qa:delete_menu")
     kb.button(text="✅ Рассчитанные", callback_data="patients:settled")
     kb.button(text="⏳ Не рассчитанные", callback_data="patients:unsettled")
+    kb.button(text="👤 Ваш профиль", callback_data="qa:profile")
     kb.button(text="ℹ️ Полная справка", callback_data="qa:help")
-    kb.adjust(1, 1, 1, 2, 1)
+    kb.adjust(1, 1, 1, 2, 1, 1)
     return kb
 
 async def send_quick_actions(target: Message | CallbackQuery):
@@ -174,8 +229,18 @@ async def send_referral_list_numbered(
 class Onboarding(StatesGroup):
     waiting_full_name = State()
 
+class DoctorProfile(StatesGroup):
+    waiting_phone = State()
+    waiting_specialization = State()
+    waiting_workplace = State()
+    waiting_city = State()
+
 class EditName(StatesGroup):
     waiting_new_full_name = State()
+
+class EditProfile(StatesGroup):
+    waiting_field = State()
+    waiting_value = State()
 
 class AddPatient(StatesGroup):
     waiting_patient_full_name = State()
@@ -193,16 +258,26 @@ async def start_handler(msg: Message, state: FSMContext):
     tg_user_id = msg.from_user.id
     doctor = get_doctor_by_tg(tg_user_id)
 
+    # Если врача нет — сначала ФИО
     if doctor is None:
-        await msg.answer(
-            "Здравствуйте! Я бот для врачей.\n"
-            "Чтобы продолжить, пожалуйста, укажите ваши ФИО одной строкой (например: «Иванов Иван Иванович»)."
-        )
+        await msg.answer("Здравствуйте! Для начала отправьте ваши ФИО одной строкой (например: Иванов Иван Иванович).")
         await state.set_state(Onboarding.waiting_full_name)
         return
 
-    await msg.answer("Здравствуйте! Регистрация уже выполнена.\n" + fmt_help(initialized=True))
+    # Если профиль не заполнен — запускаем профиль
+    if not doctor_profile_complete(doctor):
+        await msg.answer(
+            "✅ Авторизация успешна.\n"
+            "Нужно заполнить профиль врача.\n\n"
+            "Введите номер телефона (обязательно):"
+        )
+        await state.set_state(DoctorProfile.waiting_phone)
+        return
+
+    # Всё заполнено — обычный режим
+    await msg.answer("✅ Авторизация успешна.\nℹ️ Полное меню — команда /help")
     await send_quick_actions(msg)
+
 
 @router.message(Command("help"))
 async def help_handler(msg: Message):
@@ -233,6 +308,116 @@ async def edit_name_start(msg: Message, state: FSMContext):
     await msg.answer("Отправьте новые ФИО одной строкой (например: «Иванов Иван Иванович»).")
     await state.set_state(EditName.waiting_new_full_name)
 
+@router.message(Command("profile"))
+async def profile_cmd(msg: Message):
+    tg_user_id = msg.from_user.id
+    doctor = get_doctor_by_tg(tg_user_id)
+    if doctor is None:
+        await msg.answer("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
+        return
+    await msg.answer(fmt_profile(doctor), reply_markup=kb_profile().as_markup())
+    # меню не показываем автоматически — только профиль
+
+@router.callback_query(F.data == "qa:profile")
+async def qa_profile(cb: CallbackQuery):
+    tg_user_id = cb.from_user.id
+    doctor = get_doctor_by_tg(tg_user_id)
+    if doctor is None:
+        await cb.message.answer("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
+        await cb.answer()
+        return
+    await cb.message.answer(fmt_profile(doctor), reply_markup=kb_profile().as_markup())
+    await cb.answer()
+
+@router.callback_query(F.data == "profile:back")
+async def profile_back(cb: CallbackQuery):
+    await cb.answer()
+    await send_quick_actions(cb)
+
+@router.callback_query(F.data == "profile:edit")
+async def profile_edit(cb: CallbackQuery, state: FSMContext):
+    tg_user_id = cb.from_user.id
+    doctor = get_doctor_by_tg(tg_user_id)
+    if doctor is None:
+        await cb.message.answer("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
+        await cb.answer()
+        return
+    await state.clear()
+    await cb.message.answer("Что хотите изменить?", reply_markup=kb_profile_fields().as_markup())
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("profile:field:"))
+async def profile_pick_field(cb: CallbackQuery, state: FSMContext):
+    field = cb.data.split(":")[-1]
+    await state.update_data(profile_field=field)
+    await state.set_state(EditProfile.waiting_value)
+
+    prompts = {
+        "full_name": "Введите новое ФИО одной строкой:",
+        "phone": "Введите новый номер телефона (пример: +79001234567 или 89001234567):",
+        "specialization": "Введите новую специализацию:",
+        "workplace": "Введите новое место работы:",
+        "city": "Введите новый город:",
+    }
+    await cb.message.answer(prompts.get(field, "Введите новое значение:"))
+    await cb.answer()
+
+@router.message(EditProfile.waiting_value)
+async def profile_apply_value(msg: Message, state: FSMContext):
+    tg_user_id = msg.from_user.id
+    doctor = get_doctor_by_tg(tg_user_id)
+    if doctor is None:
+        await state.clear()
+        await msg.answer("Сначала зарегистрируйтесь: отправьте ваши ФИО одной строкой.")
+        return
+
+    data = await state.get_data()
+    field = data.get("profile_field")
+    value = (msg.text or "").strip()
+
+    # валидируем
+    if field == "full_name":
+        if not is_valid_full_name(value):
+            await msg.answer("Некорректное ФИО. Попробуйте ещё раз:")
+            return
+        update_doctor_name(tg_user_id, value)
+
+    elif field == "phone":
+        phone = normalize_phone(value)
+        if not phone:
+            await msg.answer("❌ Некорректный номер. Пример: +79001234567 или 89001234567. Попробуйте ещё раз:")
+            return
+        # обновляем через update_doctor_profile, сохраняя остальные поля
+        update_doctor_profile(
+            tg_user_id=tg_user_id,
+            phone=phone,
+            specialization=doctor.get("specialization") or "",
+            workplace=doctor.get("workplace") or "",
+            city=doctor.get("city") or "",
+        )
+
+    elif field in ("specialization", "workplace", "city"):
+        if not value:
+            await msg.answer("Поле не может быть пустым. Попробуйте ещё раз:")
+            return
+        # обновляем через update_doctor_profile, сохраняя остальные поля
+        update_doctor_profile(
+            tg_user_id=tg_user_id,
+            phone=doctor.get("phone") or "",
+            specialization=value if field == "specialization" else (doctor.get("specialization") or ""),
+            workplace=value if field == "workplace" else (doctor.get("workplace") or ""),
+            city=value if field == "city" else (doctor.get("city") or ""),
+        )
+    else:
+        await msg.answer("Неизвестное поле.")
+        await state.clear()
+        return
+
+    await state.clear()
+    doctor2 = get_doctor_by_tg(tg_user_id)
+    await msg.answer("✅ Данные обновлены.")
+    await msg.answer(fmt_profile(doctor2), reply_markup=kb_profile().as_markup())
+
 @router.message(Onboarding.waiting_full_name)
 async def onboarding_full_name(msg: Message, state: FSMContext):
     full_name = (msg.text or "").strip()
@@ -243,12 +428,71 @@ async def onboarding_full_name(msg: Message, state: FSMContext):
             "Попробуйте ещё раз:"
         )
         return
+ 
     tg_user_id = msg.from_user.id
     upsert_doctor(tg_user_id, full_name)
+
     await state.clear()
-    await msg.answer(f"Готово. Зарегистрированы как: {full_name}\n\n" + fmt_help(initialized=True))
-    await send_quick_actions(msg)
+    await msg.answer("Готово. Теперь нужно заполнить профиль.\n\nВведите номер телефона (обязательно):")
+    await state.set_state(DoctorProfile.waiting_phone)
     log.info(f"Doctor registered tg_user_id={tg_user_id} full_name={full_name}")
+
+@router.message(DoctorProfile.waiting_phone)
+async def profile_phone(msg: Message, state: FSMContext):
+    phone = normalize_phone(msg.text)
+    if not phone:
+            await msg.answer("❌ Некорректный номер. Пример: +79001234567 или 89001234567. Попробуйте ещё раз:")
+            return
+    await state.update_data(phone=phone)
+    await msg.answer("Ваша специализация (например: терапевт, ортопед, хирург):")
+    await state.set_state(DoctorProfile.waiting_specialization)
+
+@router.message(DoctorProfile.waiting_specialization)
+async def profile_specialization(msg: Message, state: FSMContext):
+    spec = (msg.text or "").strip()
+    if not spec:
+        await msg.answer("Поле не может быть пустым. Введите вашу специализацию:")
+        return
+    await state.update_data(specialization=spec)
+    await msg.answer("Место работы (например: Клиника Здоровья, Поликлиника №...):")
+    await state.set_state(DoctorProfile.waiting_workplace)
+
+@router.message(DoctorProfile.waiting_workplace)
+async def profile_workplace(msg: Message, state: FSMContext):
+    workplace = (msg.text or "").strip()
+    if not workplace:
+        await msg.answer("Поле не может быть пустым. Введите место работы:")
+        return
+    await state.update_data(workplace=workplace)
+    await msg.answer("Город:")
+    await state.set_state(DoctorProfile.waiting_city)
+
+@router.message(DoctorProfile.waiting_city)
+async def profile_city(msg: Message, state: FSMContext):
+    city = (msg.text or "").strip()
+    if not city:
+        await msg.answer("Поле не может быть пустым. Введите город:")
+        return
+
+    data = await state.get_data()
+    phone = data["phone"]
+    specialization = data["specialization"]
+    workplace = data["workplace"]
+
+    tg_user_id = msg.from_user.id
+    update_doctor_profile(
+        tg_user_id=tg_user_id,
+        phone=phone,
+        specialization=specialization,
+        workplace=workplace,
+        city=city,
+    )
+
+    await state.clear()
+    await msg.answer("✅ Профиль заполнен.\nℹ️ Полное меню — команда /help")
+    await send_quick_actions(msg)
+
+    log.info(f"Doctor profile updated tg_user_id={tg_user_id} phone={phone} city={city}")
 
 @router.message(EditName.waiting_new_full_name)
 async def edit_name_apply(msg: Message, state: FSMContext):
@@ -658,6 +902,10 @@ async def qa_help(cb: CallbackQuery):
 async def main():
     migrate()
     bot = Bot(get_doctor_token())
+
+    from aiogram.enums import ParseMode
+
+    bot = Bot(get_doctor_token(), parse_mode=ParseMode.HTML)
 
     # для самопроверки токена — видно в логе, каким ботом запущено
     me = await bot.get_me()

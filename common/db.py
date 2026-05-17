@@ -145,6 +145,10 @@ def migrate() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_patients_fullname_birthdate ON patients(full_name, birth_date)"
         )
+# ensure doctor profile columns exist
+        for col in ("phone", "specialization", "workplace", "city"):
+            if not _column_exists(conn, "doctors", col):
+                conn.execute(f"ALTER TABLE doctors ADD COLUMN {col} TEXT")
 
     log.info("Migrations applied")
 
@@ -172,7 +176,13 @@ def admin_unauthorize(chat_id: int) -> None:
 def get_doctor_by_tg(tg_user_id: int) -> Optional[dict]:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, tg_user_id, full_name, created_at, updated_at FROM doctors WHERE tg_user_id = ?",
+            """
+            SELECT id, tg_user_id, full_name,
+       phone, specialization, workplace, city,
+       created_at, updated_at
+FROM doctors
+WHERE tg_user_id = ?
+            """,
             (tg_user_id,),
         ).fetchone()
         return dict(row) if row else None
@@ -206,6 +216,27 @@ def update_doctor_name(tg_user_id: int, full_name: str) -> None:
             (full_name, full_name_lc, tg_user_id),
         )
 
+def update_doctor_profile(
+    tg_user_id: int,
+    phone: str,
+    specialization: str,
+    workplace: str,
+    city: str,
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE doctors
+               SET phone = ?,
+                   specialization = ?,
+                   workplace = ?,
+                   city = ?,
+                   updated_at = CURRENT_TIMESTAMP
+             WHERE tg_user_id = ?
+            """,
+            (phone, specialization, workplace, city, tg_user_id),
+        )
+
 
 def get_doctor_id_by_tg(tg_user_id: int) -> Optional[int]:
     with get_conn() as conn:
@@ -217,6 +248,21 @@ def delete_doctor(doctor_id: int) -> int:
     with get_conn() as conn:
         cur = conn.execute("DELETE FROM doctors WHERE id = ?", (doctor_id,))
         return cur.rowcount
+
+
+with get_conn() as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(doctors)").fetchall()}
+
+        to_add = {
+            "phone": "TEXT",
+            "specialization": "TEXT",
+            "workplace": "TEXT",
+            "city": "TEXT",
+        }
+        for col, col_type in to_add.items():
+            if col not in cols:
+                conn.execute(f"ALTER TABLE doctors ADD COLUMN {col} {col_type};")
+
 
 
 # --- Patients & Referrals ---
@@ -330,14 +376,18 @@ def _build_token_like_sql_from_word_start(column: str, tokens: list[str]) -> tup
 
 def list_doctors_with_counts() -> list[dict]:
     sql = """
-    SELECT d.id            AS doctor_id,
-           d.full_name     AS full_name,
-           d.tg_user_id    AS tg_user_id,
-           COUNT(r.id)     AS referrals_count
-      FROM doctors d
- LEFT JOIN referrals r ON r.doctor_id = d.id
-  GROUP BY d.id
-  ORDER BY d.created_at ASC, d.id ASC
+SELECT d.id AS doctor_id,
+       d.full_name AS full_name,
+       d.tg_user_id AS tg_user_id,
+       d.phone AS phone,
+       d.specialization AS specialization,
+       d.workplace AS workplace,
+       d.city AS city,
+       COUNT(r.id) AS referrals_count
+    FROM doctors d
+    LEFT JOIN referrals r ON r.doctor_id = d.id
+    GROUP BY d.id
+    ORDER BY d.created_at ASC, d.id ASC
     """
     with get_conn() as conn:
         rows = conn.execute(sql).fetchall()

@@ -105,6 +105,12 @@ def _kb_back_menu() -> InlineKeyboardBuilder:
     kb.adjust(1)
     return kb
 
+def _kb_doctors_actions() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👁 Пациенты врача", callback_data="adm:doc_patients")
+    kb.button(text="⬅️ В меню", callback_data="adm:back")
+    kb.adjust(1)
+    return kb
 
 async def _send_chunked(msg: Message, title: str, lines: list[str]):
     if not lines:
@@ -136,6 +142,13 @@ def _fmt_birth_ru(birth_iso: str | None) -> str:
         return datetime.strptime(birth_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
     except Exception:
         return "— дата не указана"
+
+def _fmt_doctor_profile(d: dict) -> str:
+    phone = (d.get("phone") or "—").strip() if isinstance(d.get("phone"), str) else (d.get("phone") or "—")
+    spec = (d.get("specialization") or "—").strip() if isinstance(d.get("specialization"), str) else (d.get("specialization") or "—")
+    work = (d.get("workplace") or "—").strip() if isinstance(d.get("workplace"), str) else (d.get("workplace") or "—")
+    city = (d.get("city") or "—").strip() if isinstance(d.get("city"), str) else (d.get("city") or "—")
+    return f"{spec}, {city}, {work}, {phone}"
 
 
 def _expand_numbers(spec: str, max_n: int) -> list[int]:
@@ -257,23 +270,39 @@ async def auth_or_ignore(msg: Message):
 
 @router.callback_query(F.data == "adm:doctors")
 async def list_doctors(cb: CallbackQuery, state: FSMContext):
+    # важно: сразу убираем "крутилку" у Telegram
+    await cb.answer()
+
+    if not admin_is_authorized(cb.message.chat.id):
+        await cb.message.answer("Сначала авторизуйтесь — отправьте секретный пароль.")
+        return
+
     data = list_doctors_with_counts()
     if not data:
         await cb.message.answer("Список врачей пуст.")
-        await cb.answer()
         return
 
-    lines = [f"{i}. {d['full_name']} — направлений: {d['referrals_count']}" for i, d in enumerate(data, 1)]
+    # сохраняем doctor_id по порядку (для команды «Пациенты врача»)
+    await state.update_data(last_doctor_list=[int(d["doctor_id"]) for d in data])
+
+    lines = []
+    for i, d in enumerate(data, 1):
+        full_name = d.get("full_name") or "—"
+        cnt = int(d.get("referrals_count") or 0)
+        profile = _fmt_doctor_profile(d)
+        lines.append(f"{i}. {full_name} — {profile} — направлений: {cnt}")
+
     await cb.message.answer("👨‍⚕️ Список врачей:")
     await _send_chunked(cb.message, "Врачи:", lines)
-    await state.update_data(last_doctor_list=[int(d["doctor_id"]) for d in data], last_doctor_lines=lines)
+    await cb.message.answer("Действия со списком:", reply_markup=_kb_doctors_actions().as_markup())
 
-    kb = InlineKeyboardBuilder()
-    kb.button(text="👁 Пациенты врача", callback_data="adm:doc_patients")
-    kb.adjust(1)
-    await cb.message.answer("Действия со списком:", reply_markup=kb.as_markup())
-    await cb.answer()
 
+    lines = []
+    for i, d in enumerate(data, 1):
+        full_name = d.get("full_name") or "—"
+        cnt = int(d.get("referrals_count") or 0)
+        profile = _fmt_doctor_profile(d)
+        lines.append(f"{i}. {full_name} — {profile} — направлений: {cnt}")
 
 @router.callback_query(F.data == "adm:doc_patients")
 async def doc_patients_start(cb: CallbackQuery, state: FSMContext):
